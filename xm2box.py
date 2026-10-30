@@ -48,7 +48,9 @@ MAX_VIBRATO_DEPTH = 50
 MAX_VIBRATO_SPEED = 30
 MOD_SLOTS = 6
 MOD_NO_CHANNEL = -2
-MOD_VIBRATO_DEPTH, MOD_VIBRATO_SPEED = 16, 18  # positions in UltraBox's list of modulators
+MOD_PAN, MOD_VIBRATO_DEPTH, MOD_VIBRATO_SPEED = 6, 16, 18  # positions in UltraBox's list of modulators
+MAX_PAN = 100
+PAN_TOLERANCE = 3  # how far a simplified pan curve may stray, out of MAX_PAN
 HANDLED_EFFECTS = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 15, 33}
 HANDLED_EXTENDED = {1, 2, 6, 10, 11, 12, 13, 14}
 EFFECT_NAMES = {0: "arpeggio", 7: "tremolo", 8: "set pan",
@@ -96,18 +98,22 @@ def parse_xm(path):
     for index in range(1, instrument_count + 1):
         size = struct.unpack_from("<I", d, p)[0]
         sample_count = struct.unpack_from("<H", d, p + 27)[0]
-        instrument = dict(name=read_string(d[p + 4:p + 26]), samples=[], keymap=None, volume_envelope=None, pan_envelope=False, auto_vibrato=None)
+        instrument = dict(name=read_string(d[p + 4:p + 26]), samples=[], keymap=None, volume_envelope=None, pan_envelope=None, auto_vibrato=None)
         if sample_count:
             sample_header = struct.unpack_from("<I", d, p + 29)[0]
             instrument["keymap"] = d[p + 33:p + 129]
-            point_count, _, sustain, loop_start, loop_end, _, _, _, kind, pan_kind, vibrato_kind, sweep, depth, rate = struct.unpack_from("<14B", d, p + 225)
+            point_count, pan_count, sustain, loop_start, loop_end, pan_sustain, pan_start, pan_end, kind, pan_kind, vibrato_kind, sweep, depth, rate = struct.unpack_from("<14B", d, p + 225)
+            fadeout = struct.unpack_from("<H", d, p + 239)[0]
+
+            def read_envelope(at, count, flags, hold, first, last):
+                values = struct.unpack_from(f"<{count * 2}H", d, at)
+                return dict(points=list(zip(values[::2], values[1::2])), sustain=hold if flags & 2 else None,
+                            loop=(first, last) if flags & 4 else None, fadeout=fadeout)
+
             if kind & 1 and point_count:
-                values = struct.unpack_from(f"<{point_count * 2}H", d, p + 129)
-                instrument["volume_envelope"] = dict(points=list(zip(values[::2], values[1::2])),
-                                                     sustain=sustain if kind & 2 else None,
-                                                     loop=(loop_start, loop_end) if kind & 4 else None,
-                                                     fadeout=struct.unpack_from("<H", d, p + 239)[0])
-            instrument["pan_envelope"] = bool(pan_kind & 1)
+                instrument["volume_envelope"] = read_envelope(p + 129, point_count, kind, sustain, loop_start, loop_end)
+            if pan_kind & 1 and pan_count:
+                instrument["pan_envelope"] = read_envelope(p + 177, pan_count, pan_kind, pan_sustain, pan_start, pan_end)
             if depth and rate:
                 instrument["auto_vibrato"] = dict(kind=vibrato_kind, sweep=sweep, depth=depth, rate=rate)
             q = p + size
@@ -185,6 +191,7 @@ class Voice:
         self.path = [(start, 0.0)]  # (time, semitones away from the note's pitch)
         self.vibrato = []  # (start, end, raw speed, raw depth)
         self.envelope = []  # (time, volume envelope and fadeout as a share of full volume)
+        self.pan = []  # (time, UltraBox's raw pan)
 
     def add_point(self, time, volume):
         if self.points and time <= self.points[-1][0]:
@@ -203,8 +210,8 @@ class Voice:
             self.path.append((end, self.offset() + change))
 
 
-class VolumeEnvelope:
-    """A channel's place in an instrument's volume envelope, stepped tick by tick as FT2 does."""
+class Envelope:
+    """A channel's place in an instrument's volume or pan envelope, stepped tick by tick as FT2 does."""
 
     def __init__(self, envelope):
         self.envelope = envelope
@@ -213,7 +220,14 @@ class VolumeEnvelope:
         self.released = False
 
     def value(self):
-        return _value_at(self.envelope["points"], self.tick) / 64 * self.fade / FADE_START
+        return _value_at(self.envelope["points"], self.tick)
+
+    def volume_share(self):
+        return self.value() / 64 * self.fade / FADE_START
+
+    def pan_for(self, pan):
+        """FT2 swings the sample's pan by the envelope, as far as the nearer edge of the stereo field allows."""
+        return pan + (self.value() - 32) * (128 - abs(pan - 128)) / 32
 
     def advance(self):
         points, sustain, loop = (self.envelope[k] for k in ("points", "sustain", "loop"))
@@ -246,7 +260,10 @@ def most_common_speed_and_bpm(song):
                         bpm = param
             speeds[speed] += 1
             bpms[bpm] += speed
-    return speeds.most_common(1)[0][0], bpms.most_common(1)[0][0]
+    main_bpm = bpms.most_common(1)[0][0]
+    # Songs can wander by a BPM or two, so use the average of the BPMs near the main one to stop the song drifting.
+    close = {b: n for b, n in bpms.items() if abs(b - main_bpm) / main_bpm <= BPM_JITTER}
+    return speeds.most_common(1)[0][0], sum(b * n for b, n in close.items()) / sum(close.values())
 
 
 def simulate(song):
@@ -274,6 +291,7 @@ def simulate(song):
     extra_fine_memory = [[0, 0] for _ in range(channels)]
     vibrato_memory = [[0, 0] for _ in range(channels)]
     envelopes = [None] * channels
+    pan_envelopes = [None] * channels
     ignored = collections.Counter()
     order_starts = {}
     speed, bpm = song["speed"], song["bpm"]
@@ -355,9 +373,13 @@ def simulate(song):
                     # FT2 restarts the envelope on an instrument number, and not on a note without one.
                     instrument = song["instruments"].get(instrument_index)
                     envelope = instrument["volume_envelope"] if instrument else None
-                    envelopes[ch] = VolumeEnvelope(envelope) if envelope else None
+                    envelopes[ch] = Envelope(envelope) if envelope else None
+                    envelope = instrument["pan_envelope"] if instrument else None
+                    pan_envelopes[ch] = Envelope(envelope) if envelope else None
                 is_porta = effect in (3, 5) or column >> 4 == 0xF
                 if note == 97:
+                    if pan_envelopes[ch]:
+                        pan_envelopes[ch].released = True
                     if envelopes[ch]:
                         envelopes[ch].released = True  # the note fades out instead of stopping
                     else:
@@ -461,12 +483,17 @@ def simulate(song):
                     volumes[ch] = 0.0
                     finish(ch, now + (param & 15) * tick)
             for ch, voice in enumerate(voices):
-                if voice and envelopes[ch]:
+                if voice and (envelopes[ch] or pan_envelopes[ch]):
                     for step in range(speed * (1 + pattern_delay)):
                         time = now + step * tick
-                        if time >= voice.start:
-                            voice.envelope.append((time, envelopes[ch].value()))
+                        if time < voice.start:
+                            continue
+                        if envelopes[ch]:
+                            voice.envelope.append((time, envelopes[ch].volume_share()))
                             envelopes[ch].advance()
+                        if pan_envelopes[ch]:
+                            voice.pan.append((time, pan_envelopes[ch].pan_for(last_sample[ch]["pan"]) / 255 * MAX_PAN))
+                            pan_envelopes[ch].advance()
             now += speed * (1 + pattern_delay) * tick
             if jump_back is not None:
                 row = jump_back
@@ -571,7 +598,11 @@ def build_note_pieces(voice, bar_parts):
 
 def simplify_volumes(volumes):
     """Pick the times a note's volume shape needs points at, so that a fade is one smooth line and not many steps."""
-    sizes = [(t, (v / 64) ** (2 / 3) * NOTE_SIZE_MAX) for t, v in volumes]
+    return simplify_points([(t, (v / 64) ** (2 / 3) * NOTE_SIZE_MAX) for t, v in volumes], VOLUME_TOLERANCE)
+
+
+def simplify_points(sizes, tolerance):
+    """Find the inner points a curve can't lose without straying further than the tolerance."""
     kept = set()
     spans = [(0, len(sizes) - 1)]
     while spans:
@@ -581,7 +612,7 @@ def simplify_volumes(volumes):
         (t0, s0), (t1, s1) = sizes[first], sizes[last]
         errors = [(abs(sizes[i][1] - (s0 + (s1 - s0) * (sizes[i][0] - t0) / (t1 - t0))), i) for i in range(first + 1, last)]
         error, worst = max(errors)
-        if error > VOLUME_TOLERANCE:
+        if error > tolerance:
             kept.add(sizes[worst][0])
             spans += [(first, worst), (worst, last)]
     return kept
@@ -688,7 +719,7 @@ def pitch_volume_offset(pitches):
     return max(-MAX_VOLUME, min(MAX_VOLUME, INSTRUMENT_VOLUME + offset))
 
 
-def instrument_json(instrument, song, volume=INSTRUMENT_VOLUME, vibrato_speed=None):
+def instrument_json(instrument, song, volume=INSTRUMENT_VOLUME, vibrato_speed=None, moving_pan=False):
     index, sample_index, offset = instrument
     sample = song["instruments"][index]["samples"][sample_index]
     frames = sample["loop_end"] if sample["loop"] != LOOP_NONE else sample["frames"]
@@ -697,7 +728,7 @@ def instrument_json(instrument, song, volume=INSTRUMENT_VOLUME, vibrato_speed=No
                   isUsingAdvancedLoopControls=True, chipWaveLoopMode=sample["loop"], chipWavePlayBackwards=False,
                   chipWaveLoopStart=sample["loop_start"] if sample["loop"] != LOOP_NONE else 0,
                   chipWaveLoopEnd=frames, chipWaveStartOffset=offset)
-    if sample["pan"] != 128:
+    if sample["pan"] != 128 or moving_pan:
         result["effects"] = ["panning"]
         result["pan"] = round((sample["pan"] - 128) / 128 * 100)
     auto = song["instruments"][index].get("auto_settings")
@@ -718,7 +749,7 @@ def auto_vibrato_settings(auto, bpm, parts_per_tick):
                 delay=min(MAX_VIBRATO_DELAY, round(auto["sweep"] / 2 * parts_per_tick)))
 
 
-def build_channel(slot, song, shifts, bar_count, ticks_per_beat, bar_parts, vibrato_speeds):
+def build_channel(slot, song, shifts, bar_count, ticks_per_beat, bar_parts, vibrato_speeds, panned):
     patterns, lookup = [], {}
     sequence = []
     instruments = slot["instruments"]
@@ -753,7 +784,7 @@ def build_channel(slot, song, shifts, bar_count, ticks_per_beat, bar_parts, vibr
             lookup[key] = len(patterns)
         sequence.append(lookup[key])
     channel = dict(type="pitch", name=slot["name"], patterns=patterns, sequence=sequence,
-                   instruments=[instrument_json(i, song, pitch_volume_offset(instrument_pitches[i]), vibrato_speeds.get(i)) for i in instruments])
+                   instruments=[instrument_json(i, song, pitch_volume_offset(instrument_pitches[i]), vibrato_speeds.get(i), i in panned) for i in instruments])
     if all_pitches:
         octave = max(0, min(8, (int(statistics.median(all_pitches)) - 18) // 12))
         channel["octaveScrollBar"] = octave - 1
@@ -783,20 +814,38 @@ def with_vibrato_stops(bars, bar_parts, resting_depth):
     runs = sorted(run for row in bars.values() for run in row)
     result = collections.defaultdict(list)
     for index, (start, end, depth) in enumerate(runs):
-        result[start // bar_parts].append((start, end, depth))
+        result[start // bar_parts].append([(start, depth), (end, depth)])
         if index + 1 == len(runs) or runs[index + 1][0] != end:
-            result[end // bar_parts].append((end, end + 1, resting_depth))
+            result[end // bar_parts].append([(end, resting_depth), (end + 1, resting_depth)])
     return result
+
+
+def pan_curves(slot):
+    """Collect a channel's pan envelopes as {instrument: {bar: [mod note points]}}, one note for each note piece."""
+    curves = collections.defaultdict(lambda: collections.defaultdict(list))
+    for bar, pieces in sorted(slot["notes"].items()):
+        for voice, piece, _ in sorted(pieces, key=lambda n: n[1][0][0]):
+            if not voice.pan:
+                continue
+            pan = sorted(dict((round(t), v) for t, v in voice.pan).items())
+            first, last = piece[0][0], piece[-1][0]
+            inner = [p for p in pan if first < p[0] < last]
+            curve = [(first, _value_at(pan, first))] + inner + [(last, _value_at(pan, last))]
+            kept = simplify_points(curve, PAN_TOLERANCE)
+            curves[voice.instrument][bar].append([(t, round(v)) for t, v in curve if t in kept or t in (first, last)])
+    return curves
 
 
 def build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts):
     """Build the modulation channels that switch vibrato on and off, as FT2's effects do row by row.
 
-    Returns the channels and each channel's {instrument: resting vibrato speed}. A second
-    target for speed is only used where one instrument on one channel uses several speeds.
+    Pan envelopes also go here, as curves. Returns the channels, each channel's
+    {instrument: resting vibrato speed}, and each channel's set of instruments with moving pan.
+    A second target for speed is only used where one instrument on one channel uses several speeds.
     """
     targets = []
     speeds = []
+    panned = []
     for channel_index, slot in enumerate(slots):
         rest = {}
         for instrument, bars in sorted(vibrato_runs(slot).items()):
@@ -811,8 +860,12 @@ def build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts):
             resting_depth = round(auto["depth"] * VIBRATO_RAW_PER_SEMITONE) if auto else 0
             targets.append((*where, MOD_VIBRATO_DEPTH, with_vibrato_stops(depths, bar_parts, resting_depth)))
             if len(used) > 1:
-                targets.append((*where, MOD_VIBRATO_SPEED, {b: [(s, e, v) for s, e, v, _ in row] for b, row in bars.items()}))
+                targets.append((*where, MOD_VIBRATO_SPEED, {b: [[(s, v), (e, v)] for s, e, v, _ in row] for b, row in bars.items()}))
         speeds.append(rest)
+        curves = pan_curves(slot)
+        panned.append(set(curves))
+        for instrument, bars in sorted(curves.items()):
+            targets.append((channel_index, slot["instruments"].index(instrument), MOD_PAN, bars))
     channels = []
     for group in range(0, len(targets), MOD_SLOTS):
         members = targets[group:group + MOD_SLOTS]
@@ -824,10 +877,10 @@ def build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts):
         for bar in range(bar_count):
             notes = []
             for slot_index, member in enumerate(members):
-                for start, end, value in member[3].get(bar, []):
-                    ticks = [(t - bar * bar_parts) * ticks_per_beat / PARTS_PER_BEAT for t in (start, end)]
-                    notes.append((start, dict(pitches=[MOD_SLOTS - 1 - slot_index],
-                                              points=[dict(tick=t, pitchBend=0, volume=value, forMod=True) for t in ticks])))
+                for curve in member[3].get(bar, []):
+                    notes.append((curve[0][0], dict(pitches=[MOD_SLOTS - 1 - slot_index], points=[
+                        dict(tick=(t - bar * bar_parts) * ticks_per_beat / PARTS_PER_BEAT, pitchBend=0, volume=value, forMod=True)
+                        for t, value in curve])))
             if not notes:
                 sequence.append(0)
                 continue
@@ -837,8 +890,8 @@ def build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts):
                 patterns.append(pattern)
                 lookup[key] = len(patterns)
             sequence.append(lookup[key])
-        channels.append(dict(type="mod", name=f"Vibrato {len(channels) + 1}", instruments=[instrument], patterns=patterns, sequence=sequence))
-    return channels, speeds
+        channels.append(dict(type="mod", name=f"Mod {len(channels) + 1}", instruments=[instrument], patterns=patterns, sequence=sequence))
+    return channels, speeds, panned
 
 
 def add_lead_in(played, bar_parts):
@@ -853,6 +906,7 @@ def add_lead_in(played, bar_parts):
             voice.path = [(t + lead_in, o) for t, o in voice.path]
             voice.vibrato = [(a + lead_in, b + lead_in, s, d) for a, b, s, d in voice.vibrato]
             voice.envelope = [(t + lead_in, v) for t, v in voice.envelope]
+            voice.pan = [(t + lead_in, v) for t, v in voice.pan]
     played["order_starts"] = {k: t + lead_in for k, t in played["order_starts"].items()}
     played["length"] += lead_in
     played["loop_start"] += lead_in
@@ -909,8 +963,8 @@ def convert(path, output_dir, beats_per_bar):
     for instrument in song["instruments"].values():
         if instrument["auto_vibrato"]:
             instrument["auto_settings"] = auto_vibrato_settings(instrument["auto_vibrato"], played["base_bpm"], played["parts_per_tick"])
-    mod_channels, vibrato_speeds = build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts)
-    channels = [build_channel(s, song, shifts, bar_count, ticks_per_beat, bar_parts, v) for s, v in zip(slots, vibrato_speeds)]
+    mod_channels, vibrato_speeds, panned = build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts)
+    channels = [build_channel(s, song, shifts, bar_count, ticks_per_beat, bar_parts, v, m) for s, v, m in zip(slots, vibrato_speeds, panned)]
     if len(channels) > MAX_CHANNELS or len(mod_channels) > MAX_CHANNELS:
         raise SystemExit(f"{path.name} needs {len(channels)} note and {len(mod_channels)} modulation channels; UltraBox allows {MAX_CHANNELS} of each")
     channels += mod_channels
@@ -927,7 +981,6 @@ def convert(path, output_dir, beats_per_bar):
     slid = [v for c in by_xm for v, _ in c if any(o for _, o in v.path)]
     fine_only = sum(1 for v in slid if max(abs(o) for _, o in v.path) < 0.5)
     played_instruments = sorted({v.instrument[0] for c in by_xm for v, _ in c})
-    pan_enveloped = [i for i in played_instruments if song["instruments"][i]["pan_envelope"]]
     swept = [i for i in played_instruments if (song["instruments"][i]["auto_vibrato"] or {}).get("sweep")]
     other_waves = [i for i in played_instruments if (song["instruments"][i]["auto_vibrato"] or {}).get("kind")]
     note_total = sum(len(c) for c in by_xm)
@@ -938,7 +991,7 @@ def convert(path, output_dir, beats_per_bar):
     lines = [f"{path.name} -> {json_path.name}", "",
              f"Tempo {result['beatsPerMinute']} (FT2 speed {played['base_speed']}, BPM {played['base_bpm']} = {PARTS_PER_ROW} parts per row, 4 rows per beat)",
              f"{bar_count} bars of {beats_per_bar} beats, rhythm grid {ticks_per_beat} per beat ({on_grid:.1%} of notes on the 1/4 beat grid)",
-             f"{len(channels) - len(mod_channels)} note channels and {len(mod_channels)} vibrato modulation channels (from {song['channels']} XM channels)",
+             f"{len(channels) - len(mod_channels)} note channels and {len(mod_channels)} modulation channels for vibrato and pan (from {song['channels']} XM channels)",
              f"{note_total} notes kept, {dropped} dropped because they were silent or shorter than one part",
              f"{pattern_total} unique patterns across {used_bars} used channel-bars ({1 - pattern_total / max(1, used_bars):.0%} reuse)",
              f"{aligned} of {len(played['order_starts'])} XM song positions start exactly on a bar line ({lead_in / PARTS_PER_BEAT:g} beats of silent lead-in added)",
@@ -950,8 +1003,6 @@ def convert(path, output_dir, beats_per_bar):
     shifted = {f"{wave_name(*k)}": s for k, s in shifts.items() if s}
     if shifted:
         lines += ["", f"Moved by octaves to fit the pitch range: {shifted}"]
-    if pan_enveloped:
-        lines += ["", f"Panning envelopes not carried over, on instruments: {', '.join(map(str, pan_enveloped))}"]
     if swept:
         lines += ["", f"Auto-vibrato sweep is a delay instead of a gradual fade-in, on instruments: {', '.join(map(str, swept))}"]
     if other_waves:
