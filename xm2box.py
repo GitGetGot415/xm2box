@@ -6,6 +6,10 @@ own samples, which are stored inside the song file. The report written next to t
 lists what was left out.
 
 Usage: python xm2box.py song.xm [-o output_dir] [--beats-per-bar 16]
+
+For a song too big for that, --rough makes an approximate version: pan moves between a few fixed
+positions, parts can share and swap channels, and the samples are written to a folder that
+serve_samples.py has to be running on when the song is open in UltraBox.
 """
 import argparse
 import base64
@@ -73,6 +77,8 @@ PAN_COLUMN_STEP = 17  # volume column Cx sets pan to x times this
 PAN_SLIDE_LEFT, PAN_SLIDE_RIGHT, PAN_SET = 0xD, 0xE, 0xC
 RETRIGGER_VOLUME = {1: -1, 2: -2, 3: -4, 4: -8, 5: -16, 9: 1, 10: 2, 11: 4, 12: 8, 13: 16}
 RETRIGGER_SCALE = {6: 2 / 3, 7: 1 / 2, 14: 3 / 2, 15: 2}
+ROUGH_PAN_POSITIONS = 5  # how many fixed places a note can sit in the stereo field in --rough mode
+DEFAULT_SAMPLE_URL = "http://127.0.0.1:8765/"
 BAR_SIZES = (16, 8, 4, 2)  # the longest bar that fits a song's channels is the easiest to work with
 
 
@@ -230,8 +236,8 @@ def fit_samples_in_url(song, shifts):
     return total, halved
 
 
-def wav_data_url(sample, name, root_key):
-    """Build an UltraBox custom sample URL holding the sample as an embedded WAV file.
+def wav_file(sample, name):
+    """Build a sample's WAV file.
 
     UltraBox names a sample after whatever follows the last "/" in its URL. So the
     WAV ends with an unused chunk whose base64 text spells "/<name>", which makes
@@ -249,7 +255,12 @@ def wav_data_url(sample, name, root_key):
     chunk = b"\0" * filler + label
     body = (b"WAVE" + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, SAMPLE_RATE * width, width, 8 * width)
             + b"data" + struct.pack("<I", len(audio)) + audio + b"JUNK" + struct.pack("<I", len(chunk)) + chunk)
-    encoded = base64.b64encode(b"RIFF" + struct.pack("<I", len(body)) + body).decode("ascii")
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def wav_data_url(sample, name, root_key):
+    """Build an UltraBox custom sample URL holding the sample as an embedded WAV file."""
+    encoded = base64.b64encode(wav_file(sample, name)).decode("ascii")
     return f"!s{SAMPLE_RATE},r{root_key:g}!data:audio/wav;base64,{encoded}"
 
 
@@ -834,6 +845,83 @@ def assign_channels(notes_by_xm, bar_parts):
     return merge_sparse_channels(assigned)
 
 
+def fixed_pan_position(voice, sample):
+    """Where a note sits on average, moved to the nearest of a few fixed places in the stereo field (-100 to 100)."""
+    raw = statistics.mean(v for _, v in voice.pan) if voice.pan else sample["pan"] / 255 * MAX_PAN
+    pan = (raw - MAX_PAN / 2) * 2
+    step = 200 / (ROUGH_PAN_POSITIONS - 1) if ROUGH_PAN_POSITIONS > 1 else 200
+    return round(round(pan / step) * step) if ROUGH_PAN_POSITIONS > 1 else 0
+
+
+def note_energy(piece):
+    return sum((b[0] - a[0]) * (a[1] ** 2 + b[1] ** 2) for a, b in zip(piece, piece[1:]))
+
+
+def assign_tracks(notes_by_xm):
+    """Lay a song out with no regard for its XM channels, for songs too big to keep them apart.
+
+    In each bar, a sound gets as many channels as it has overlapping notes. Those go to the channels
+    they used last where they can. If a bar still doesn't fit, its quietest tracks are left out.
+    """
+    by_bar = collections.defaultdict(lambda: collections.defaultdict(list))
+    for channel in notes_by_xm:
+        for voice, pieces in channel:
+            for bar, piece, continues in pieces:
+                by_bar[bar][voice.instrument].append((voice, piece, continues))
+    slots = []
+    previous = collections.defaultdict(list)
+    dropped_pieces = 0
+    for bar in sorted(by_bar):
+        tracks = []
+        for instrument, pieces in by_bar[bar].items():
+            mine = []
+            for item in sorted(pieces, key=lambda n: n[1][0][0]):
+                start, end = item[1][0][0], item[1][-1][0]
+                for track in mine:
+                    if track["end"] <= start:
+                        break
+                else:
+                    track = dict(instrument=instrument, end=0, notes=[], energy=0.0)
+                    mine.append(track)
+                    tracks.append(track)
+                track["end"] = end
+                track["notes"].append(item)
+                track["energy"] += note_energy(item[1])
+        tracks.sort(key=lambda t: -t["energy"])
+        for track in tracks[MAX_CHANNELS:]:
+            dropped_pieces += len(track["notes"])
+        tracks = tracks[:MAX_CHANNELS]
+        taken = set()
+        placed = collections.defaultdict(list)
+        waiting = []
+        for track in tracks:  # keep sounds where they were, loudest first
+            usual = [s for s in previous[track["instrument"]] if id(s) not in taken]
+            if usual:
+                taken.add(id(usual[0]))
+                usual[0]["notes"][bar].extend(track["notes"])
+                placed[track["instrument"]].append(usual[0])
+            else:
+                waiting.append(track)
+        for track in waiting:
+            free = [s for s in slots if id(s) not in taken]
+            slot = next((s for s in free if track["instrument"] in s["instruments"]), None)
+            slot = slot or next((s for s in free if len(s["instruments"]) < MAX_INSTRUMENTS_PER_CHANNEL), None)
+            if slot is None and len(slots) < MAX_CHANNELS:
+                slot = dict(xm=len(slots), instruments=[], notes=collections.defaultdict(list), name=f"Track {len(slots) + 1}")
+                slots.append(slot)
+            if slot is None:
+                dropped_pieces += len(track["notes"])
+                continue
+            if track["instrument"] not in slot["instruments"]:
+                slot["instruments"].append(track["instrument"])
+            taken.add(id(slot))
+            slot["notes"][bar].extend(track["notes"])
+            placed[track["instrument"]].append(slot)
+        for instrument, where in placed.items():
+            previous[instrument] = where + [s for s in previous[instrument] if s not in where]
+    return slots, dropped_pieces
+
+
 def merge_sparse_channels(slots):
     """Fold rarely used channels into others that are silent in those bars."""
     bar_count = max((max(s["notes"]) for s in slots), default=0) + 1
@@ -881,7 +969,7 @@ def fine_detune(voice):
 
 
 def instrument_json(instrument, song, volume=INSTRUMENT_VOLUME, vibrato_speed=None, moving_pan=False):
-    index, sample_index, offset, cents = instrument
+    index, sample_index, offset, cents, *fixed_pan = instrument
     sample = song["instruments"][index]["samples"][sample_index]
     frames = sample["loop_end"] if sample["loop"] != LOOP_NONE else sample["frames"]
     keep = 2 if sample.get("halved") else 1  # a halved sample has half as many frames to count through
@@ -893,6 +981,9 @@ def instrument_json(instrument, song, volume=INSTRUMENT_VOLUME, vibrato_speed=No
     if sample["pan"] != 128 or moving_pan:
         result["effects"] = ["panning"]
         result["pan"] = round((sample["pan"] - 128) / 128 * 100)
+    if fixed_pan:
+        result["effects"] = ["panning"]
+        result["pan"] = fixed_pan[0]
     if song["instruments"][index].get("chord_arpeggio"):
         result["effects"] = result["effects"] + ["chord type", "transition type"]
         result.update(chord="arpeggio", transition="interrupt", fastTwoNoteArp=True, arpeggioSpeed=song["arpeggio_speed"])
@@ -1116,19 +1207,25 @@ def estimated_loudness(song, played):
     return math.sqrt(levels[int(len(levels) * 0.95)]) if levels else 1.0
 
 
-def custom_samples(song, shifts):
-    """One embedded sample per (instrument, sample) that gets played."""
+def custom_samples(song, shifts, sample_url=None, folder=None):
+    """One sample per (instrument, sample) that gets played, embedded or else written to a folder to be served."""
     urls = []
     for index, sample_index in sorted(shifts):
         sample = song["instruments"][index]["samples"][sample_index]
         # A halved sample has half the frames for the same sound, so it plays an octave down to keep its speed.
         root_key = ROOT_KEY + shifts[(index, sample_index)] - sample["finetune"] / 128 + (12 if sample.get("halved") else 0)
-        urls.append(wav_data_url(sample, wave_name(index, sample_index), root_key))
+        name = wave_name(index, sample_index)
+        if sample_url:
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / name).write_bytes(wav_file(sample, name))
+            urls.append(f"!s{SAMPLE_RATE},r{root_key:g}!{sample_url}{name}")
+        else:
+            urls.append(wav_data_url(sample, name, root_key))
     return urls
 
 
 def describe_instrument(instrument):
-    index, sample_index, offset, cents = instrument
+    index, sample_index, offset, cents, *fixed_pan = instrument
     text = str(index)
     if sample_index:
         text += f" sample {sample_index + 1}"
@@ -1136,10 +1233,12 @@ def describe_instrument(instrument):
         text += f" from frame {offset}"
     if cents:
         text += f" detuned {cents:+d}"
+    if fixed_pan and fixed_pan[0]:
+        text += f" pan {fixed_pan[0]:+d}"
     return text
 
 
-def convert(path, output_dir, beats_per_bar):
+def convert(path, output_dir, beats_per_bar, rough=False, sample_url=None):
     song = parse_xm(path)
     played = simulate(song)
     bar_parts = beats_per_bar * PARTS_PER_BEAT
@@ -1150,6 +1249,10 @@ def convert(path, output_dir, beats_per_bar):
     for channel in played["notes"]:
         for voice in channel:
             voice.instrument = (*voice.instrument, fine_detune(voice))
+            if rough:
+                sample = song["instruments"][voice.instrument[0]]["samples"][voice.instrument[1]]
+                voice.instrument = (*voice.instrument, fixed_pan_position(voice, sample))
+                voice.pan = []
     shifts = pitch_shifts(played["notes"])
     by_xm = []
     dropped = 0
@@ -1170,11 +1273,11 @@ def convert(path, output_dir, beats_per_bar):
         by_xm.append(kept)
     on_grid = starts[True] / max(1, sum(starts.values()))
     ticks_per_beat = 4 if on_grid >= ON_GRID_SHARE else PARTS_PER_BEAT
-    sample_chars, halved = fit_samples_in_url(song, shifts)
+    sample_chars, halved = fit_samples_in_url(song, shifts) if not sample_url else (0, [])
     # With UltraBox's compressor off to match FT2's linear mixing, a song's level is set here to suit how busy it is.
     loudness = estimated_loudness(song, played)
     master_gain = round(min(MAX_MASTER_GAIN, math.sqrt(LEVEL_TARGET / loudness)) * 50) / 50
-    slots = assign_channels(by_xm, bar_parts)
+    slots, dropped_pieces = assign_tracks(by_xm) if rough else (assign_channels(by_xm, bar_parts), 0)
     bar_count = math.ceil(round(played["length"]) / bar_parts)
     for instrument in song["instruments"].values():
         if instrument["auto_vibrato"]:
@@ -1185,7 +1288,8 @@ def convert(path, output_dir, beats_per_bar):
         raise TooManyChannels(f"{path.name} needs {len(channels)} note and {len(mod_channels)} modulation channels at {beats_per_bar} beats per bar; UltraBox allows {MAX_CHANNELS} of each")
     channels += mod_channels
     intro = int(played["loop_start"] // bar_parts)
-    samples = custom_samples(song, shifts)
+    sample_folder = output_dir / f"{path.stem}.samples"
+    samples = custom_samples(song, shifts, sample_url, sample_folder)
     result = {"format": "UltraBox", "version": 5, "name": song["title"] or path.stem, "scale": "Free", "key": "C",
               "introBars": intro, "loopBars": bar_count - intro, "beatsPerBar": beats_per_bar,
               "ticksPerBeat": ticks_per_beat, "beatsPerMinute": round(played["tempo"]),
@@ -1210,7 +1314,8 @@ def convert(path, output_dir, beats_per_bar):
              f"{note_total} notes kept, {dropped} dropped because they were silent or shorter than one part",
              f"{pattern_total} unique patterns across {used_bars} used channel-bars ({1 - pattern_total / max(1, used_bars):.0%} reuse)",
              f"{aligned} of {len(played['order_starts'])} XM song positions start exactly on a bar line ({lead_in / PARTS_PER_BEAT:g} beats of silent lead-in added)",
-             f"{len(samples)} samples embedded, {sum(len(u) for u in samples) / 1e6:.2f} MB in the song file, {len(variants)} instrument variants", "",
+             (f"{len(samples)} samples in {sample_folder.name}, which serve_samples.py must be serving while the song is open, {len(variants)} instrument variants" if sample_url else
+              f"{len(samples)} samples embedded, {sum(len(u) for u in samples) / 1e6:.2f} MB in the song file, {len(variants)} instrument variants"), "",
              "Channel map (XM instrument numbers, in the same order as each channel's instrument list):"]
     for slot in slots:
         merged = f" (also holds {', '.join(slot['merged'])})" if slot.get("merged") else ""
@@ -1222,6 +1327,8 @@ def convert(path, output_dir, beats_per_bar):
         lines += ["", f"Auto-vibrato sweep is a delay instead of a gradual fade-in, on instruments: {', '.join(map(str, swept))}"]
     if other_waves:
         lines += ["", f"Auto-vibrato uses a sine instead of another waveform, on instruments: {', '.join(map(str, other_waves))}"]
+    if rough:
+        lines += ["", f"Rough version: pan uses {ROUGH_PAN_POSITIONS} fixed positions, and {dropped_pieces} of {sum(len(p) for c in by_xm for _, p in c)} note pieces were left out to fit {MAX_CHANNELS} channels"]
     if detuned:
         lines += ["", f"{detuned} notes have small pitch shifts carried over as detuned instrument variants"]
     if halved:
@@ -1243,11 +1350,14 @@ def main():
     parser.add_argument("xm", type=pathlib.Path)
     parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path("output"))
     parser.add_argument("--beats-per-bar", type=int, help="by default, the longest bar that fits the song's channels")
+    parser.add_argument("--rough", action="store_true", help="make an approximate version of a song too big to convert normally")
+    parser.add_argument("--sample-url", help=f"serve samples from here instead of embedding them (--rough uses {DEFAULT_SAMPLE_URL})")
     args = parser.parse_args()
     error = None
+    sample_url = args.sample_url or (DEFAULT_SAMPLE_URL if args.rough else None)
     for beats in ([args.beats_per_bar] if args.beats_per_bar else BAR_SIZES):
         try:
-            return convert(args.xm, args.output, beats)
+            return convert(args.xm, args.output, beats, args.rough, sample_url)
         except TooManyChannels as problem:
             error = problem
     raise SystemExit(str(error))
