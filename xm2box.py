@@ -37,6 +37,8 @@ AUTO_VIBRATO_SEMITONES_PER_STEP = 1 / 64
 AUTO_VIBRATO_TICKS_PER_CYCLE = 256
 MAX_VIBRATO_DELAY = 49  # UltraBox treats 50 as "never"
 VOLUME_PER_PITCH = 1 / 48 / 0.1428  # UltraBox's pitch damping of 48, over its volume scale of 0.1428
+REFERENCE_FRAMES = 1600  # the sample length that needs no correction
+MASTER_GAIN = 1.7  # with UltraBox's compressor off to match FT2's linear mixing, this brings songs back up to a healthy level
 LOOP_FORWARD, LOOP_PING_PONG, LOOP_NONE = 0, 1, 2  # UltraBox's chipWaveLoopMode values
 SEMITONES_PER_PORTA_STEP = 1 / 16  # linear periods: 1xx, 2xx, 3xx and E1x move 4 of the 64 units in a semitone
 SEMITONES_PER_EXTRA_FINE_STEP = 1 / 64
@@ -44,6 +46,11 @@ VIBRATO_RAW_PER_SEMITONE = 25
 VIBRATO_DEPTH_RAW_PER_STEP = VIBRATO_RAW_PER_SEMITONE / 8  # FT2 peaks at y/8 semitones, UltraBox at raw/25
 VIBRATO_RAW_SPEED_HZ = 0.1 / 0.14  # UltraBox's rate per raw speed: 0.1 of its 0.14 second vibrato period
 VIBRATO_TICKS_PER_CYCLE = 64  # FT2's vibrato takes this many ticks at speed 1
+SAMPLE_URL_BUDGET = 930_000  # Firefox rejects URLs past 1,048,576 characters, and this leaves room for notes and edits
+SAMPLE_URL_OVERHEAD = 90
+HALVING_LOSS_LIMIT = 0.02  # the most power a sample may lose from having its rate halved
+HALF_BAND_FILTER = ((-3, -1), (-1, 9), (0, 16), (1, 9), (3, -1))
+HALF_BAND_SCALE = 32
 MAX_VIBRATO_DEPTH = 50
 MAX_VIBRATO_SPEED = 30
 MOD_SLOTS = 6
@@ -156,6 +163,60 @@ def decode_sample(sample):
     return bytes(out)
 
 
+def sample_audio(sample):
+    """The bytes a sample keeps in the song: FT2 never plays past a loop, and a halved sample has every other frame."""
+    width = 2 if sample["wide"] else 1
+    audio = decode_sample(sample)
+    if sample["loop"] != LOOP_NONE:
+        audio = audio[:sample["loop_end"] * width]  # FT2 never plays past the end of a loop
+    return halve_rate(audio, sample["wide"]) if sample.get("halved") else audio
+
+
+def as_values(audio, wide):
+    if wide:
+        return list(struct.unpack(f"<{len(audio) // 2}h", audio))
+    return [b - 128 for b in audio]
+
+
+def halve_rate(audio, wide):
+    """Keep every other frame, after a half-band filter so that what's lost is removed and doesn't alias."""
+    values = as_values(audio, wide)
+    last = len(values) - 1
+    kept = []
+    for i in range(0, len(values), 2):
+        total = sum(weight * values[max(0, min(last, i + offset))] for offset, weight in HALF_BAND_FILTER)
+        kept.append(round(total / HALF_BAND_SCALE))
+    if wide:
+        return struct.pack(f"<{len(kept)}h", *(max(-32768, min(32767, v)) for v in kept))
+    return bytes(max(0, min(255, v + 128)) for v in kept)
+
+
+def upper_half_share(sample):
+    """How much of a sample's power is in the upper half of its range, which halving its rate would lose."""
+    values = as_values(sample_audio(sample), sample["wide"])
+    diffs = [(a - b) ** 2 for a, b in zip(values, values[1:])]
+    pairs = [(a + b) ** 2 for a, b in zip(values, values[1:])]
+    return sum(diffs) / max(1, sum(diffs) + sum(pairs))
+
+
+def fit_samples_in_url(song, shifts):
+    """Halve the rate of the biggest samples that lose the least, until the song fits in a Firefox URL."""
+    samples = {key: song["instruments"][key[0]]["samples"][key[1]] for key in shifts}
+    size = lambda: sum(len(sample_audio(s)) * 4 // 3 + SAMPLE_URL_OVERHEAD for s in samples.values())
+    total = size()
+    halved = []
+    candidates = sorted(samples, key=lambda k: -len(sample_audio(samples[k])))
+    for key in candidates:
+        if total <= SAMPLE_URL_BUDGET:
+            break
+        if upper_half_share(samples[key]) > HALVING_LOSS_LIMIT:
+            continue
+        samples[key]["halved"] = True
+        halved.append(key)
+        total = size()
+    return total, halved
+
+
 def wav_data_url(sample, name, root_key):
     """Build an UltraBox custom sample URL holding the sample as an embedded WAV file.
 
@@ -165,9 +226,7 @@ def wav_data_url(sample, name, root_key):
     of 4 long, so that the "/" and the name fill whole base64 groups.
     """
     width = 2 if sample["wide"] else 1
-    audio = decode_sample(sample)
-    if sample["loop"] != LOOP_NONE:
-        audio = audio[:sample["loop_end"] * width]  # FT2 never plays past the end of a loop
+    audio = sample_audio(sample)
     if len(audio) % 2:
         audio += b"\0"
     label = base64.b64decode("/" + name)
@@ -183,7 +242,7 @@ def wav_data_url(sample, name, root_key):
 
 class Voice:
     def __init__(self, instrument, pitch, start, end_limit):
-        self.instrument = instrument  # (XM instrument, sample within it, start offset in frames)
+        self.instrument = instrument  # (XM instrument, sample within it, start offset in frames), later with detune in cents
         self.pitch = pitch
         self.start = start
         self.end = end_limit
@@ -713,24 +772,44 @@ def wave_name(index, sample_index):
     return f"Inst{index:02d}{'abcdefghijklmnopqrstuvwxyz'[sample_index % 26]}"
 
 
-def pitch_volume_offset(pitches):
-    """UltraBox plays higher notes more quietly and FT2 doesn't, so offset that for an instrument's usual pitch."""
-    offset = round((statistics.median(pitches) - NATIVE_PITCH) * VOLUME_PER_PITCH)
-    return max(-MAX_VOLUME, min(MAX_VOLUME, INSTRUMENT_VOLUME + offset))
+def pitch_volume_offset(pitches, frames):
+    """Cancel out UltraBox's habit of playing higher pitches more quietly, which FT2 doesn't have.
+
+    For samples it counts the pitch a whole sample would have if it were one cycle of a wave, so
+    a long sample counts as a very low pitch and comes out loud. That means its length matters too.
+    """
+    pitch = statistics.median(pitches) - NATIVE_PITCH - 12 * math.log2(max(1, frames) / REFERENCE_FRAMES)
+    return max(-MAX_VOLUME, min(MAX_VOLUME, INSTRUMENT_VOLUME + round(pitch * VOLUME_PER_PITCH)))
+
+
+def fine_detune(voice):
+    """Find a note's lasting pitch shift of under half a semitone, in cents, which a whole-semitone bend can't hold.
+
+    These matter more than their size suggests. When two channels play the same sample and one is nudged like this,
+    FT2 gives a chorus, where without the nudge the two stay in phase and come out about 3 dB too loud.
+    """
+    offsets = [o for _, o in voice.path]
+    if not any(offsets) or max(abs(o) for o in offsets) >= 0.5:
+        return 0
+    return round(offsets[-1] * 100)
 
 
 def instrument_json(instrument, song, volume=INSTRUMENT_VOLUME, vibrato_speed=None, moving_pan=False):
-    index, sample_index, offset = instrument
+    index, sample_index, offset, cents = instrument
     sample = song["instruments"][index]["samples"][sample_index]
     frames = sample["loop_end"] if sample["loop"] != LOOP_NONE else sample["frames"]
+    keep = 2 if sample.get("halved") else 1  # a halved sample has half as many frames to count through
     result = dict(type="chip", volume=volume, wave=wave_name(index, sample_index), eqFilter=[], effects=[],
                   fadeInSeconds=0, fadeOutTicks=-3, chord="simultaneous", envelopes=[], unison="none",
                   isUsingAdvancedLoopControls=True, chipWaveLoopMode=sample["loop"], chipWavePlayBackwards=False,
-                  chipWaveLoopStart=sample["loop_start"] if sample["loop"] != LOOP_NONE else 0,
-                  chipWaveLoopEnd=frames, chipWaveStartOffset=offset)
+                  chipWaveLoopStart=(sample["loop_start"] if sample["loop"] != LOOP_NONE else 0) // keep,
+                  chipWaveLoopEnd=frames // keep, chipWaveStartOffset=offset // keep)
     if sample["pan"] != 128 or moving_pan:
         result["effects"] = ["panning"]
         result["pan"] = round((sample["pan"] - 128) / 128 * 100)
+    if cents:
+        result["effects"] = result["effects"] + ["detune"]
+        result["detuneCents"] = cents
     auto = song["instruments"][index].get("auto_settings")
     if vibrato_speed is not None or auto:
         # Without auto-vibrato the depth stays 0 here, because a modulation channel turns the vibrato on and off.
@@ -749,6 +828,12 @@ def auto_vibrato_settings(auto, bpm, parts_per_tick):
                 delay=min(MAX_VIBRATO_DELAY, round(auto["sweep"] / 2 * parts_per_tick)))
 
 
+def sample_frames(instrument, song):
+    """How long a sample is in UltraBox before any halving, which leaves its loudness the same."""
+    sample = song["instruments"][instrument[0]]["samples"][instrument[1]]
+    return sample["loop_end"] if sample["loop"] != LOOP_NONE else sample["frames"]
+
+
 def build_channel(slot, song, shifts, bar_count, ticks_per_beat, bar_parts, vibrato_speeds, panned):
     patterns, lookup = [], {}
     sequence = []
@@ -764,7 +849,7 @@ def build_channel(slot, song, shifts, bar_count, ticks_per_beat, bar_parts, vibr
         for voice, piece, continues in pieces:
             pitch = voice.pitch + shifts[voice.instrument[:2]]
             all_pitches.append(pitch)
-            instrument_pitches[voice.instrument].append(pitch)
+            instrument_pitches[voice.instrument].append(voice.pitch)  # a shift moves the root key too, so it changes nothing
             points = []
             for time, volume, bend in piece:
                 level = to_json_volume(volume)
@@ -784,7 +869,7 @@ def build_channel(slot, song, shifts, bar_count, ticks_per_beat, bar_parts, vibr
             lookup[key] = len(patterns)
         sequence.append(lookup[key])
     channel = dict(type="pitch", name=slot["name"], patterns=patterns, sequence=sequence,
-                   instruments=[instrument_json(i, song, pitch_volume_offset(instrument_pitches[i]), vibrato_speeds.get(i), i in panned) for i in instruments])
+                   instruments=[instrument_json(i, song, pitch_volume_offset(instrument_pitches[i], sample_frames(i, song)), vibrato_speeds.get(i), i in panned) for i in instruments])
     if all_pitches:
         octave = max(0, min(8, (int(statistics.median(all_pitches)) - 18) // 12))
         channel["octaveScrollBar"] = octave - 1
@@ -918,18 +1003,21 @@ def custom_samples(song, shifts):
     urls = []
     for index, sample_index in sorted(shifts):
         sample = song["instruments"][index]["samples"][sample_index]
-        root_key = ROOT_KEY + shifts[(index, sample_index)] - sample["finetune"] / 128
+        # A halved sample has half the frames for the same sound, so it plays an octave down to keep its speed.
+        root_key = ROOT_KEY + shifts[(index, sample_index)] - sample["finetune"] / 128 + (12 if sample.get("halved") else 0)
         urls.append(wav_data_url(sample, wave_name(index, sample_index), root_key))
     return urls
 
 
 def describe_instrument(instrument):
-    index, sample_index, offset = instrument
+    index, sample_index, offset, cents = instrument
     text = str(index)
     if sample_index:
         text += f" sample {sample_index + 1}"
     if offset:
         text += f" from frame {offset}"
+    if cents:
+        text += f" detuned {cents:+d}"
     return text
 
 
@@ -938,6 +1026,9 @@ def convert(path, output_dir, beats_per_bar):
     played = simulate(song)
     bar_parts = beats_per_bar * PARTS_PER_BEAT
     lead_in = add_lead_in(played, bar_parts)
+    for channel in played["notes"]:
+        for voice in channel:
+            voice.instrument = (*voice.instrument, fine_detune(voice))
     shifts = pitch_shifts(played["notes"])
     by_xm = []
     dropped = 0
@@ -958,6 +1049,7 @@ def convert(path, output_dir, beats_per_bar):
         by_xm.append(kept)
     on_grid = starts[True] / max(1, sum(starts.values()))
     ticks_per_beat = 4 if on_grid >= ON_GRID_SHARE else PARTS_PER_BEAT
+    sample_chars, halved = fit_samples_in_url(song, shifts)
     slots = assign_channels(by_xm, bar_parts)
     bar_count = math.ceil(round(played["length"]) / bar_parts)
     for instrument in song["instruments"].values():
@@ -973,13 +1065,12 @@ def convert(path, output_dir, beats_per_bar):
     result = {"format": "UltraBox", "version": 5, "name": song["title"] or path.stem, "scale": "Free", "key": "C",
               "introBars": intro, "loopBars": bar_count - intro, "beatsPerBar": beats_per_bar,
               "ticksPerBeat": ticks_per_beat, "beatsPerMinute": round(played["tempo"]),
-              "layeredInstruments": False, "patternInstruments": True, "customSamples": samples, "channels": channels}
+              "layeredInstruments": False, "patternInstruments": True, "compressionRatio": 0, "masterGain": MASTER_GAIN, "customSamples": samples, "channels": channels}
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{path.stem}.ultrabox.json"
     json_path.write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
 
-    slid = [v for c in by_xm for v, _ in c if any(o for _, o in v.path)]
-    fine_only = sum(1 for v in slid if max(abs(o) for _, o in v.path) < 0.5)
+    detuned = sum(1 for c in by_xm for v, _ in c if v.instrument[3])
     played_instruments = sorted({v.instrument[0] for c in by_xm for v, _ in c})
     swept = [i for i in played_instruments if (song["instruments"][i]["auto_vibrato"] or {}).get("sweep")]
     other_waves = [i for i in played_instruments if (song["instruments"][i]["auto_vibrato"] or {}).get("kind")]
@@ -1007,8 +1098,14 @@ def convert(path, output_dir, beats_per_bar):
         lines += ["", f"Auto-vibrato sweep is a delay instead of a gradual fade-in, on instruments: {', '.join(map(str, swept))}"]
     if other_waves:
         lines += ["", f"Auto-vibrato uses a sine instead of another waveform, on instruments: {', '.join(map(str, other_waves))}"]
-    if fine_only:
-        lines += ["", f"{fine_only} notes have fine pitch shifts under half a semitone, which BeepBox's whole-semitone bends can't hold"]
+    if detuned:
+        lines += ["", f"{detuned} notes have small pitch shifts carried over as detuned instrument variants"]
+    if halved:
+        lines += ["", f"Samples at half their rate, so the song fits in a Firefox URL: {', '.join(wave_name(*k) for k in halved)}"]
+    if sample_chars > SAMPLE_URL_BUDGET:
+        warning = (f"WARNING: the samples take {sample_chars / 1e6:.2f} MB, over the {SAMPLE_URL_BUDGET / 1e6:.2f} MB that fits in a Firefox URL. "
+                   "UltraBox in Firefox won't load them and will play its default wave instead. Chrome and Edge allow about 2 MB.")
+        lines += ["", warning]
     lines += ["", "Effects not carried over:"]
     lines += [f"  {count:>6}  {name}" for name, count in played["ignored"].most_common()] or ["  none"]
     report_path = output_dir / f"{path.stem}.report.txt"
