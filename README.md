@@ -22,6 +22,8 @@ python convert_xm.py
 
 Choose an `.xm` file, select UltraBox or BeepBox, and click **Convert**. Converted files are saved in `output/`.
 
+No songs are included with this project. To try it out, you can download `.xm` files such as Anvil's from [Modland](https://modland.com/pub/modules/Fasttracker%202/Anvil/). The commands below expect them in a folder named `xm/`. These songs belong to their authors and aren't covered by this project's license.
+
 For a player that reads the song file directly, tick **Keep full-quality samples in one file** before converting to UltraBox.
 
 ## Command line
