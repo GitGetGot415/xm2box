@@ -838,8 +838,10 @@ def assign_channels(notes_by_xm, bar_parts):
         previous = {}
         for bar in sorted(by_bar):
             taken = set()
-            # Instruments that already have a channel choose first, so they can keep it.
-            for instrument in sorted(by_bar[bar], key=lambda i: (i not in previous, -counts[i], i)):
+            # An instrument with a note still sounding chooses first, because moving that note would restart its
+            # sample. Then come instruments that already have a channel, so they can keep it.
+            held = {i for i, items in by_bar[bar].items() if any(continues for _, _, continues in items)}
+            for instrument in sorted(by_bar[bar], key=lambda i: (i not in held, i not in previous, -counts[i], i)):
                 candidates = [s for s in slots if id(s) not in taken]
                 slot = previous.get(instrument) if previous.get(instrument) in candidates else None
                 slot = slot or next((s for s in candidates if instrument in s["instruments"]), None)
@@ -873,8 +875,9 @@ def note_energy(piece):
 def assign_tracks(notes_by_xm):
     """Lay a song out with no regard for its XM channels, for songs too big to keep them apart.
 
-    In each bar, a sound gets as many channels as it has overlapping notes. Those go to the channels
-    they used last where they can. If a bar still doesn't fit, its quietest tracks are left out.
+    In each bar, a sound gets as many channels as it has overlapping notes. A note still sounding from
+    the last bar stays on its channel, because moving it would restart its sample. Other notes go to the
+    channels their sound used last where they can. If a bar still doesn't fit, its quietest tracks are left out.
     """
     by_bar = collections.defaultdict(lambda: collections.defaultdict(list))
     for channel in notes_by_xm:
@@ -883,18 +886,19 @@ def assign_tracks(notes_by_xm):
                 by_bar[bar][voice.instrument].append((voice, piece, continues))
     slots = []
     previous = collections.defaultdict(list)
+    held_on = {}  # each note's channel so far
     dropped_pieces = 0
     for bar in sorted(by_bar):
         tracks = []
         for instrument, pieces in by_bar[bar].items():
             mine = []
-            for item in sorted(pieces, key=lambda n: n[1][0][0]):
+            for item in sorted(pieces, key=lambda n: (n[1][0][0], not n[2])):
                 start, end = item[1][0][0], item[1][-1][0]
                 for track in mine:
                     if track["end"] <= start:
                         break
                 else:
-                    track = dict(instrument=instrument, end=0, notes=[], energy=0.0)
+                    track = dict(instrument=instrument, end=0, notes=[], energy=0.0, held=held_on.get(id(item[0])) if item[2] else None)
                     mine.append(track)
                     tracks.append(track)
                 track["end"] = end
@@ -907,12 +911,24 @@ def assign_tracks(notes_by_xm):
         taken = set()
         placed = collections.defaultdict(list)
         waiting = []
-        for track in tracks:  # keep sounds where they were, loudest first
+
+        def place(track, slot):
+            track["placed"] = True
+            taken.add(id(slot))
+            slot["notes"][bar].extend(track["notes"])
+            placed[track["instrument"]].append(slot)
+            for item in track["notes"]:
+                held_on[id(item[0])] = slot
+
+        for track in tracks:  # held notes stay put first
+            if track["held"] is not None and id(track["held"]) not in taken:
+                place(track, track["held"])
+        for track in tracks:  # then sounds stay where they were, loudest first
+            if track.get("placed"):
+                continue
             usual = [s for s in previous[track["instrument"]] if id(s) not in taken]
             if usual:
-                taken.add(id(usual[0]))
-                usual[0]["notes"][bar].extend(track["notes"])
-                placed[track["instrument"]].append(usual[0])
+                place(track, usual[0])
             else:
                 waiting.append(track)
         for track in waiting:
@@ -927,9 +943,7 @@ def assign_tracks(notes_by_xm):
                 continue
             if track["instrument"] not in slot["instruments"]:
                 slot["instruments"].append(track["instrument"])
-            taken.add(id(slot))
-            slot["notes"][bar].extend(track["notes"])
-            placed[track["instrument"]].append(slot)
+            place(track, slot)
         for instrument, where in placed.items():
             previous[instrument] = where + [s for s in previous[instrument] if s not in where]
     return slots, dropped_pieces
