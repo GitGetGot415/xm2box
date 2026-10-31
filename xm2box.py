@@ -8,8 +8,8 @@ lists what was left out.
 Usage: python xm2box.py song.xm [-o output_dir] [--beats-per-bar 16]
 
 For a song too big for that, --rough makes an approximate version: pan moves between a few fixed
-positions, parts can share and swap channels, and the samples are written to a folder that
-serve_samples.py has to be running on when the song is open in UltraBox.
+positions, parts can share and swap channels, and the samples are written to a folder. To play
+one of those, open UltraBox with start_ultrabox.py, and keep it running while the song is open.
 """
 import argparse
 import base64
@@ -19,6 +19,7 @@ import math
 import pathlib
 import statistics
 import struct
+import urllib.parse
 
 PARTS_PER_BEAT = 24
 PARTS_PER_ROW = 6  # the most common speed becomes 4 rows per beat
@@ -1218,7 +1219,7 @@ def custom_samples(song, shifts, sample_url=None, folder=None):
         if sample_url:
             folder.mkdir(parents=True, exist_ok=True)
             (folder / name).write_bytes(wav_file(sample, name))
-            urls.append(f"!s{SAMPLE_RATE},r{root_key:g}!{sample_url}{name}")
+            urls.append(f"!s{SAMPLE_RATE},r{root_key:g}!{sample_url}{urllib.parse.quote(folder.name)}/{name}")
         else:
             urls.append(wav_data_url(sample, name, root_key))
     return urls
@@ -1314,7 +1315,7 @@ def convert(path, output_dir, beats_per_bar, rough=False, sample_url=None):
              f"{note_total} notes kept, {dropped} dropped because they were silent or shorter than one part",
              f"{pattern_total} unique patterns across {used_bars} used channel-bars ({1 - pattern_total / max(1, used_bars):.0%} reuse)",
              f"{aligned} of {len(played['order_starts'])} XM song positions start exactly on a bar line ({lead_in / PARTS_PER_BEAT:g} beats of silent lead-in added)",
-             (f"{len(samples)} samples in {sample_folder.name}, which serve_samples.py must be serving while the song is open, {len(variants)} instrument variants" if sample_url else
+             (f"{len(samples)} samples in {sample_folder.name}, so open this song in UltraBox through start_ultrabox.py, {len(variants)} instrument variants" if sample_url else
               f"{len(samples)} samples embedded, {sum(len(u) for u in samples) / 1e6:.2f} MB in the song file, {len(variants)} instrument variants"), "",
              "Channel map (XM instrument numbers, in the same order as each channel's instrument list):"]
     for slot in slots:
