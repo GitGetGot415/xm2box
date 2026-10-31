@@ -577,7 +577,9 @@ def simulate(song):
                         if target is not None and porta_memory[ch] and target != voice.offset():
                             distance = target - voice.offset()
                             reach = porta_memory[ch] * SEMITONES_PER_PORTA_STEP * moves
-                            if reach >= abs(distance):
+                            if moves and reach / moves >= abs(distance):
+                                voice.slide(now + tick, now + tick, distance)  # as fast as FT2 goes: all at once, on the row's second tick
+                            elif reach >= abs(distance):
                                 voice.slide(now, now + (row_end - now) * abs(distance) / reach, distance)
                             elif reach:
                                 voice.slide(now, row_end, math.copysign(reach, distance))
@@ -702,6 +704,9 @@ def bend_points(path):
             continue
         if t0 > points[-1][0]:
             points.append((t0, round(o0)))
+        if t1 - t0 <= 1:  # too quick to show its steps
+            points.append((t1, round(o1)))
+            continue
         low, high = sorted((o0, o1))
         crossings = range(math.ceil(low), math.floor(high) + 1)
         for k in (crossings if o1 > o0 else reversed(crossings)):
@@ -737,7 +742,10 @@ def build_note_pieces(voice, bar_parts):
         return []
     bends = {}
     for t, bend in bend_points(voice.path):
-        bends[round(t)] = bend
+        part = round(t)
+        if part in bends and bends[part] != bend:
+            bends.setdefault(part - 1, bends[part])  # keep the old pitch until the jump, or it'd become a long slide
+        bends[part] = bend
     bends = sorted(bends.items())
     # A point holds a whole-semitone bend, so one placed mid-slide would turn the slide into stairs.
     times = sorted(simplify_volumes(volumes) | {t for t, _ in bends if start < t < end})
