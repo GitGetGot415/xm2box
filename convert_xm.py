@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""A small window for converting FastTracker II .xm files into UltraBox songs.
+"""A small window for converting FastTracker II .xm files into UltraBox or regular BeepBox songs.
 
 Usage: python convert_xm.py
 
-Choose a file and click Convert, and the song is saved in the output folder. A song too big to convert
-normally can be made as a rough version instead. Open UltraBox starts start_ultrabox.py to import it.
+Choose a file and a format and click Convert, and the song is saved in the output folder. For UltraBox, a song too
+big to convert normally can be made as a rough version instead, and Open UltraBox starts start_ultrabox.py to import it.
+BeepBox can't play samples, so a BeepBox song imitates them, and Open BeepBox opens the website to import it.
 """
 import contextlib
 import io
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 import xm2box
@@ -22,6 +24,8 @@ import xm2box
 PROJECT = pathlib.Path(__file__).parent
 XM_FOLDER = PROJECT / "xm"
 OUTPUT_FOLDER = PROJECT / "output"
+BEEPBOX_SITE = "https://www.beepbox.co/"
+SONG_ENDINGS = {"ultrabox": ".ultrabox.json", "beepbox": ".beepbox.json"}
 ROUGH_QUESTION = ("This song is too big to convert normally:\n\n{reason}\n\n"
                   "A rough version plays the song and can be edited, but it's less faithful. Notes keep one of a few "
                   "stereo positions, the quietest notes can be left out, and parts can move between channels. It also has to be "
@@ -37,6 +41,15 @@ def convert(path, output_folder, rough):
     return song, report.getvalue()
 
 
+def convert_to_beepbox(path, output_folder):
+    """Convert a song to regular BeepBox, keeping the report that the converter prints. Returns the song's path and the report."""
+    import xm2beepbox  # only this format needs numpy
+    report = io.StringIO()
+    with contextlib.redirect_stdout(report):
+        song = xm2beepbox.convert(path, output_folder)
+    return song, report.getvalue()
+
+
 def summarize(report):
     """Leave out the long list of what's on each channel."""
     return "\n".join(line for line in report.splitlines() if not line.startswith(("  Ch", "  Track", "Channel map"))).strip()
@@ -49,7 +62,8 @@ class App:
         self.results = queue.Queue()
         self.path = None
         self.busy = False
-        root.title("XM to UltraBox")
+        self.format = tk.StringVar(value="ultrabox")
+        root.title("XM Converter")
         root.geometry("640x460")
         root.minsize(480, 320)
         frame = ttk.Frame(root, padding=12)
@@ -60,6 +74,13 @@ class App:
         self.choose_button.pack(side="left")
         self.file_label = ttk.Label(row, text="No file chosen", padding=(10, 0))
         self.file_label.pack(side="left", fill="x", expand=True)
+        row = ttk.Frame(frame, padding=(0, 10, 0, 0))
+        row.pack(fill="x")
+        ttk.Label(row, text="Convert to:").pack(side="left")
+        self.format_buttons = [ttk.Radiobutton(row, text=text, value=value, variable=self.format)
+                               for text, value in (("UltraBox (keeps the samples)", "ultrabox"), ("BeepBox (imitates the samples)", "beepbox"))]
+        for button in self.format_buttons:
+            button.pack(side="left", padx=(10, 0))
         row = ttk.Frame(frame, padding=(0, 10))
         row.pack(fill="x")
         self.convert_button = ttk.Button(row, text="Convert", command=self.start, state="disabled")
@@ -78,6 +99,7 @@ class App:
         row = ttk.Frame(frame)
         row.pack(fill="x")
         ttk.Button(row, text="Open UltraBox", command=self.open_ultrabox).pack(side="left")
+        ttk.Button(row, text="Open BeepBox", command=lambda: webbrowser.open(BEEPBOX_SITE)).pack(side="left", padx=(8, 0))
         ttk.Button(row, text="Show output folder", command=self.show_folder).pack(side="left", padx=(8, 0))
         root.after(100, self.check_results)
 
@@ -104,6 +126,8 @@ class App:
         self.status.config(text=message)
         self.convert_button.config(state="disabled" if busy else "normal")
         self.choose_button.config(state="disabled" if busy else "normal")
+        for button in self.format_buttons:
+            button.config(state="disabled" if busy else "normal")
         if busy:
             self.progress.config(mode="indeterminate")
             self.progress.start(12)
@@ -112,21 +136,25 @@ class App:
             self.progress.config(mode="determinate", value=0)  # otherwise it still looks like it's working
 
     def start(self, rough=False):
-        existing = self.output_folder / f"{self.path.stem}.ultrabox.json"
+        song_format = self.format.get()
+        existing = self.output_folder / f"{self.path.stem}{SONG_ENDINGS[song_format]}"
         if not rough and existing.exists() and not self.confirm_overwrite(existing):
             return
         self.set_busy(True, f"Making a rough version of {self.path.name}. This can take a minute..." if rough else f"Converting {self.path.name}...")
         self.show_details("")
-        threading.Thread(target=self.work, args=(self.path, rough), daemon=True).start()
+        threading.Thread(target=self.work, args=(self.path, rough, song_format), daemon=True).start()
 
     def confirm_overwrite(self, existing):
         return messagebox.askyesno("Replace the existing song?", f"{existing.name} is already in the output folder.\n\nConvert again and replace it?")
 
-    def work(self, path, rough):
+    def work(self, path, rough, song_format):
         try:
-            self.results.put(("done", *convert(path, self.output_folder, rough), rough))
+            made = convert_to_beepbox(path, self.output_folder) if song_format == "beepbox" else convert(path, self.output_folder, rough)
+            self.results.put(("done", *made, rough))
         except (xm2box.SamplesTooBig, xm2box.TooManyChannels) as problem:
             self.results.put(("too big", str(problem)))
+        except ImportError as problem:
+            self.results.put(("needs numpy", str(problem)))
         except (Exception, SystemExit) as problem:
             self.results.put(("failed", str(problem) or type(problem).__name__))
 
@@ -149,6 +177,9 @@ class App:
             self.show_details(rest[0])
             if self.ask_rough(rest[0]):
                 self.start(rough=True)
+        elif kind == "needs numpy":
+            self.set_busy(False, "BeepBox conversion needs numpy, which isn't installed.")
+            self.show_details(f"Install it by running this in a terminal, then try again:\n\npython -m pip install numpy\n\n{rest[0]}")
         else:
             self.set_busy(False, "That file couldn't be converted.")
             self.show_details(f"{self.path.name} doesn't look like a working XM file, or something went wrong while reading it.\n\n{rest[0]}")

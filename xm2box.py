@@ -7,6 +7,8 @@ lists what was left out.
 
 Usage: python xm2box.py song.xm [-o output_dir] [--beats-per-bar 16]
 
+--beepbox makes a regular BeepBox song instead, which only imitates the samples. See xm2beepbox.py.
+
 For a song too big for that, --rough makes an approximate version: pan moves between a few fixed
 positions, parts can share and swap channels, and the samples are written to a folder. To play
 one of those, open UltraBox with start_ultrabox.py, and keep it running while the song is open.
@@ -355,13 +357,13 @@ def most_common_speed_and_bpm(song):
     return speeds.most_common(1)[0][0], sum(b * n for b, n in close.items()) / sum(close.values())
 
 
-def simulate(song):
+def simulate(song, max_tempo=MAX_TEMPO):
     """Play the module in order and return its notes, each with a time in BeepBox parts."""
     channels = song["channels"]
     base_speed, base_bpm = most_common_speed_and_bpm(song)
     scale = PARTS_PER_ROW / base_speed
     tempo = base_bpm * scale
-    while tempo > MAX_TEMPO:  # very fast modules use half the tempo and half the parts per tick
+    while tempo > max_tempo:  # very fast modules use half the tempo and half the parts per tick
         tempo /= 2
         scale /= 2
     notes = [[] for _ in range(channels)]
@@ -872,7 +874,7 @@ def note_energy(piece):
     return sum((b[0] - a[0]) * (a[1] ** 2 + b[1] ** 2) for a, b in zip(piece, piece[1:]))
 
 
-def assign_tracks(notes_by_xm):
+def assign_tracks(notes_by_xm, max_channels=MAX_CHANNELS):
     """Lay a song out with no regard for its XM channels, for songs too big to keep them apart.
 
     In each bar, a sound gets as many channels as it has overlapping notes. A note still sounding from
@@ -905,9 +907,9 @@ def assign_tracks(notes_by_xm):
                 track["notes"].append(item)
                 track["energy"] += note_energy(item[1])
         tracks.sort(key=lambda t: -t["energy"])
-        for track in tracks[MAX_CHANNELS:]:
+        for track in tracks[max_channels:]:
             dropped_pieces += len(track["notes"])
-        tracks = tracks[:MAX_CHANNELS]
+        tracks = tracks[:max_channels]
         taken = set()
         placed = collections.defaultdict(list)
         waiting = []
@@ -935,7 +937,7 @@ def assign_tracks(notes_by_xm):
             free = [s for s in slots if id(s) not in taken]
             slot = next((s for s in free if track["instrument"] in s["instruments"]), None)
             slot = slot or next((s for s in free if len(s["instruments"]) < MAX_INSTRUMENTS_PER_CHANNEL), None)
-            if slot is None and len(slots) < MAX_CHANNELS:
+            if slot is None and len(slots) < max_channels:
                 slot = dict(xm=len(slots), instruments=[], notes=collections.defaultdict(list), name=f"Track {len(slots) + 1}")
                 slots.append(slot)
             if slot is None:
@@ -1392,7 +1394,12 @@ def main():
     parser.add_argument("--beats-per-bar", type=int, help="by default, the longest bar that fits the song's channels")
     parser.add_argument("--rough", action="store_true", help="make an approximate version of a song too big to convert normally")
     parser.add_argument("--sample-url", help=f"serve samples from here instead of embedding them (--rough uses {DEFAULT_SAMPLE_URL})")
+    parser.add_argument("--beepbox", action="store_true", help="make a regular BeepBox song, which imitates the samples with built-in instruments")
     args = parser.parse_args()
+    if args.beepbox:
+        import xm2beepbox  # only this mode needs numpy
+        xm2beepbox.convert(args.xm, args.output)
+        return
     sample_url = args.sample_url or (DEFAULT_SAMPLE_URL if args.rough else None)
     try:
         convert_at_best_bar_size(args.xm, args.output, args.beats_per_bar, rough=args.rough, sample_url=sample_url)
