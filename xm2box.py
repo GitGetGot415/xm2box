@@ -37,8 +37,10 @@ AUTO_VIBRATO_SEMITONES_PER_STEP = 1 / 64
 AUTO_VIBRATO_TICKS_PER_CYCLE = 256
 MAX_VIBRATO_DELAY = 49  # UltraBox treats 50 as "never"
 VOLUME_PER_PITCH = 1 / 48 / 0.1428  # UltraBox's pitch damping of 48, over its volume scale of 0.1428
+LOUDNESS_STEP = 6  # parts between loudness estimates
 REFERENCE_FRAMES = 1600  # the sample length that needs no correction
-MASTER_GAIN = 1.7  # with UltraBox's compressor off to match FT2's linear mixing, this brings songs back up to a healthy level
+LEVEL_TARGET = 0.97  # how loud a song's estimated mix should come out, once its master gain is squared
+MAX_MASTER_GAIN = 2.5
 LOOP_FORWARD, LOOP_PING_PONG, LOOP_NONE = 0, 1, 2  # UltraBox's chipWaveLoopMode values
 SEMITONES_PER_PORTA_STEP = 1 / 16  # linear periods: 1xx, 2xx, 3xx and E1x move 4 of the 64 units in a semitone
 SEMITONES_PER_EXTRA_FINE_STEP = 1 / 64
@@ -58,13 +60,24 @@ MOD_NO_CHANNEL = -2
 MOD_PAN, MOD_VIBRATO_DEPTH, MOD_VIBRATO_SPEED = 6, 16, 18  # positions in UltraBox's list of modulators
 MAX_PAN = 100
 PAN_TOLERANCE = 3  # how far a simplified pan curve may stray, out of MAX_PAN
-HANDLED_EFFECTS = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 15, 33}
-HANDLED_EXTENDED = {1, 2, 6, 10, 11, 12, 13, 14}
-EFFECT_NAMES = {0: "arpeggio", 7: "tremolo", 8: "set pan",
-                16: "global volume", 17: "global volume slide", 20: "key off at tick",
-                21: "envelope position", 25: "pan slide", 27: "retrigger", 29: "tremor"}
+HANDLED_EFFECTS = {0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 15, 27, 33}
+HANDLED_EXTENDED = {1, 2, 6, 9, 10, 11, 12, 13, 14}
+EFFECT_NAMES = {7: "tremolo", 16: "global volume", 17: "global volume slide", 20: "key off at tick",
+                21: "envelope position", 25: "pan slide", 29: "tremor"}
 EXTENDED_NAMES = {3: "glissando control", 4: "vibrato waveform",
-                  5: "set finetune", 7: "tremolo waveform", 8: "set pan", 9: "retrigger"}
+                  5: "set finetune", 7: "tremolo waveform", 8: "set pan"}
+TINY_WAVE_FRAMES = 200  # a loop this short is a waveform, so restarting or joining its notes can't be heard
+ARPEGGIO_SPEEDS = [0, 0.0625, 0.125, 0.2, 0.25, 1 / 3, 0.4, 0.5, 2 / 3, 0.75, 0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2]  # UltraBox's table
+ARPEGGIO_TICKS_PER_CYCLE = 3  # FT2 steps through its 3 pitches a tick at a time, and UltraBox's 2-note chord takes 2 steps
+PAN_COLUMN_STEP = 17  # volume column Cx sets pan to x times this
+PAN_SLIDE_LEFT, PAN_SLIDE_RIGHT, PAN_SET = 0xD, 0xE, 0xC
+RETRIGGER_VOLUME = {1: -1, 2: -2, 3: -4, 4: -8, 5: -16, 9: 1, 10: 2, 11: 4, 12: 8, 13: 16}
+RETRIGGER_SCALE = {6: 2 / 3, 7: 1 / 2, 14: 3 / 2, 15: 2}
+BAR_SIZES = (16, 8, 4, 2)  # the longest bar that fits a song's channels is the easiest to work with
+
+
+class TooManyChannels(Exception):
+    pass
 
 
 def read_string(data):
@@ -251,6 +264,7 @@ class Voice:
         self.vibrato = []  # (start, end, raw speed, raw depth)
         self.envelope = []  # (time, volume envelope and fadeout as a share of full volume)
         self.pan = []  # (time, UltraBox's raw pan)
+        self.chord = ()  # semitones above the pitch that an arpeggio adds to the note
 
     def add_point(self, time, volume):
         if self.points and time <= self.points[-1][0]:
@@ -351,6 +365,10 @@ def simulate(song):
     vibrato_memory = [[0, 0] for _ in range(channels)]
     envelopes = [None] * channels
     pan_envelopes = [None] * channels
+    channel_pan = [128.0] * channels
+    retrigger_memory = [0] * channels
+    retrigger_count = [0] * channels
+    stopped = False
     ignored = collections.Counter()
     order_starts = {}
     speed, bpm = song["speed"], song["bpm"]
@@ -388,7 +406,9 @@ def simulate(song):
             cell_row = cells[row * channels:(row + 1) * channels]
             pattern_delay = 0
             for _, _, _, effect, param in cell_row:
-                if effect == 15 and param:
+                if effect == 15 and not param:
+                    stopped = True  # FT2 stops the song at F00
+                elif effect == 15:
                     if param < 32:
                         speed = param
                     else:
@@ -409,8 +429,6 @@ def simulate(song):
                             ignored[f"E{sub:X} {EXTENDED_NAMES.get(sub, '?')}"] += 1
                     elif effect not in HANDLED_EFFECTS:
                         ignored[f"{effect:X} {EFFECT_NAMES.get(effect, '?')}"] += 1
-                if column >> 4 in (0xC, 0xD, 0xE):
-                    ignored["volume column pan"] += 1
                 if effect == 14 and sub == 6:
                     if param & 15 == 0:
                         loop_row[ch] = row
@@ -461,8 +479,27 @@ def simulate(song):
                             limit = at + max(0, sample["frames"] - offset) / rate / (2.5 / bpm) * tick
                         if offset < sample["frames"]:
                             voices[ch] = Voice((last_instrument[ch], sample_index, offset), pitch, at, limit)
+                            retrigger_count[ch] = 0
                 if instrument_index and last_sample[ch]:
                     volumes[ch] = float(last_sample[ch]["volume"])
+                    channel_pan[ch] = float(last_sample[ch]["pan"])
+                if effect == 8:
+                    channel_pan[ch] = float(param)
+                elif column >> 4 == PAN_SET:
+                    channel_pan[ch] = float((column & 15) * PAN_COLUMN_STEP)
+                # A waveform's arpeggio is a chord note, so a note is cut where its arpeggio starts or stops.
+                voice = voices[ch]
+                if voice and last_sample[ch] and last_sample[ch]["frames"] < TINY_WAVE_FRAMES:
+                    chord = tuple(i for i in dict.fromkeys((sub, param & 15)) if i) if effect == 0 else ()
+                    if chord != voice.chord:
+                        if chord:
+                            song["instruments"][voice.instrument[0]]["chord_arpeggio"] = True
+                        if voice.start < at:
+                            joined = Voice(voice.instrument, voice.pitch, at, voice.end)
+                            joined.path = [(at, voice.offset())]
+                            finish(ch, at)
+                            voices[ch] = voice = joined
+                        voice.chord = chord
                 before = volumes[ch]
                 if 0x10 <= column <= 0x50:
                     volumes[ch] = float(column - 0x10)
@@ -538,28 +575,77 @@ def simulate(song):
                         hertz = memory[0] / VIBRATO_TICKS_PER_CYCLE * bpm * 0.4
                         voice.vibrato.append((now, row_end, min(MAX_VIBRATO_SPEED, max(1, round(hertz / VIBRATO_RAW_SPEED_HZ))),
                                               min(MAX_VIBRATO_DEPTH, round(memory[1] * VIBRATO_DEPTH_RAW_PER_STEP))))
+                    # A longer sample can't be joined up without being heard, so its arpeggio is bends.
+                    if effect == 0 and param and not voice.chord:
+                        base = voice.offset()
+                        for step in range(1, speed * (1 + pattern_delay)):
+                            wanted = base + (0, sub, param & 15)[step % ARPEGGIO_TICKS_PER_CYCLE]
+                            voice.slide(now + step * tick, now + step * tick, wanted - voice.offset())
+                        voice.slide(row_end, row_end, base - voice.offset())
+                    interval = 0
+                    if effect == 27:
+                        if param:
+                            retrigger_memory[ch] = param
+                        interval = retrigger_memory[ch] & 15
+                    elif effect == 14 and sub == 9:
+                        interval = param & 15
+                    ticks = speed * (1 + pattern_delay)
+                    for step in range(ticks) if interval else ():
+                        # Rxy counts every tick and carries on across rows, where E9x counts back from each row's end.
+                        if effect == 27:
+                            retrigger_count[ch] += 1
+                            if retrigger_count[ch] < interval:
+                                continue
+                            retrigger_count[ch] = 0
+                        elif step == 0 or (ticks - step) % interval:
+                            continue
+                        change = retrigger_memory[ch] >> 4 if effect == 27 else 0
+                        volumes[ch] = max(0.0, min(64.0, volumes[ch] * RETRIGGER_SCALE.get(change, 1) + RETRIGGER_VOLUME.get(change, 0)))
+                        time = now + step * tick
+                        if time <= voice.start:
+                            voice.add_point(time, volumes[ch])
+                            continue
+                        again = Voice(voice.instrument, voice.pitch, time, time + voice.end - voice.start)
+                        again.path = [(time, voice.offset())]
+                        again.chord = voice.chord
+                        again.add_point(time, volumes[ch])
+                        finish(ch, time)
+                        voices[ch] = voice = again
                 if effect == 14 and sub == 12 and param & 15 < speed:
                     volumes[ch] = 0.0
                     finish(ch, now + (param & 15) * tick)
+                if column >> 4 in (PAN_SLIDE_LEFT, PAN_SLIDE_RIGHT):
+                    amount = (column & 15) * (speed - 1) * (1 + pattern_delay) * (1 if column >> 4 == PAN_SLIDE_RIGHT else -1)
+                    channel_pan[ch] = max(0.0, min(255.0, channel_pan[ch] + amount))
             for ch, voice in enumerate(voices):
-                if voice and (envelopes[ch] or pan_envelopes[ch]):
+                if voice and envelopes[ch]:
                     for step in range(speed * (1 + pattern_delay)):
                         time = now + step * tick
-                        if time < voice.start:
-                            continue
-                        if envelopes[ch]:
+                        if time >= voice.start:
                             voice.envelope.append((time, envelopes[ch].volume_share()))
                             envelopes[ch].advance()
-                        if pan_envelopes[ch]:
-                            voice.pan.append((time, pan_envelopes[ch].pan_for(last_sample[ch]["pan"]) / 255 * MAX_PAN))
+                if voice and pan_envelopes[ch]:
+                    for step in range(speed * (1 + pattern_delay)):
+                        time = now + step * tick
+                        if time >= voice.start:
+                            voice.pan.append((time, pan_envelopes[ch].pan_for(channel_pan[ch]) / 255 * MAX_PAN))
                             pan_envelopes[ch].advance()
+                elif voice and (voice.pan or channel_pan[ch] != last_sample[ch]["pan"]):
+                    if not voice.pan and voice.start < now:
+                        voice.pan.append((voice.start, last_sample[ch]["pan"] / 255 * MAX_PAN))
+                    voice.pan.append((max(now, voice.start), channel_pan[ch] / 255 * MAX_PAN))
             now += speed * (1 + pattern_delay) * tick
+            if stopped:
+                break
             if jump_back is not None:
                 row = jump_back
                 continue
             if jump is not None or row_break is not None:
                 break
             row += 1
+        if stopped:
+            loop_start = 0.0
+            break
         if jump is not None:
             position = jump
             start_row = row_break or 0
@@ -807,6 +893,9 @@ def instrument_json(instrument, song, volume=INSTRUMENT_VOLUME, vibrato_speed=No
     if sample["pan"] != 128 or moving_pan:
         result["effects"] = ["panning"]
         result["pan"] = round((sample["pan"] - 128) / 128 * 100)
+    if song["instruments"][index].get("chord_arpeggio"):
+        result["effects"] = result["effects"] + ["chord type", "transition type"]
+        result.update(chord="arpeggio", transition="interrupt", fastTwoNoteArp=True, arpeggioSpeed=song["arpeggio_speed"])
     if cents:
         result["effects"] = result["effects"] + ["detune"]
         result["detuneCents"] = cents
@@ -858,7 +947,7 @@ def build_channel(slot, song, shifts, bar_count, ticks_per_beat, bar_parts, vibr
                         and points[-1]["pitchBend"] == bend and points[-2]["pitchBend"] == bend):
                     points.pop()
                 points.append(dict(tick=(time - bar * bar_parts) * ticks_per_beat / PARTS_PER_BEAT, pitchBend=bend, volume=level))
-            note = dict(pitches=[pitch], points=points)
+            note = dict(pitches=[pitch] + [pitch + i for i in voice.chord if pitch + i <= MAX_PITCH], points=points)
             if points[0]["tick"] == 0:
                 note["continuesLastPattern"] = continues
             json_notes.append(note)
@@ -905,15 +994,20 @@ def with_vibrato_stops(bars, bar_parts, resting_depth):
     return result
 
 
-def pan_curves(slot):
-    """Collect a channel's pan envelopes as {instrument: {bar: [mod note points]}}, one note for each note piece."""
+def pan_curves(slot, song):
+    """Collect a channel's moving pan as {instrument: {bar: [mod note points]}}, one note for each note piece.
+
+    A modulator holds its last value, so once one of an instrument's notes moves its pan, they all need a pan note.
+    """
     curves = collections.defaultdict(lambda: collections.defaultdict(list))
+    moving = {voice.instrument for pieces in slot["notes"].values() for voice, _, _ in pieces if voice.pan}
     for bar, pieces in sorted(slot["notes"].items()):
         for voice, piece, _ in sorted(pieces, key=lambda n: n[1][0][0]):
-            if not voice.pan:
+            if voice.instrument not in moving:
                 continue
-            pan = sorted(dict((round(t), v) for t, v in voice.pan).items())
             first, last = piece[0][0], piece[-1][0]
+            sample = song["instruments"][voice.instrument[0]]["samples"][voice.instrument[1]]
+            pan = sorted(dict((round(t), v) for t, v in voice.pan).items()) or [(first, sample["pan"] / 255 * MAX_PAN)]
             inner = [p for p in pan if first < p[0] < last]
             curve = [(first, _value_at(pan, first))] + inner + [(last, _value_at(pan, last))]
             kept = simplify_points(curve, PAN_TOLERANCE)
@@ -947,7 +1041,7 @@ def build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts):
             if len(used) > 1:
                 targets.append((*where, MOD_VIBRATO_SPEED, {b: [[(s, v), (e, v)] for s, e, v, _ in row] for b, row in bars.items()}))
         speeds.append(rest)
-        curves = pan_curves(slot)
+        curves = pan_curves(slot, song)
         panned.append(set(curves))
         for instrument, bars in sorted(curves.items()):
             targets.append((channel_index, slot["instruments"].index(instrument), MOD_PAN, bars))
@@ -998,6 +1092,30 @@ def add_lead_in(played, bar_parts):
     return lead_in
 
 
+def estimated_loudness(song, played):
+    """Roughly how loud a song's mix is in its busier moments: the root of its summed note powers, part by part."""
+    powers = {}
+    for key in {v.instrument[:2] for c in played["notes"] for v in c}:
+        sample = song["instruments"][key[0]]["samples"][key[1]]
+        values = as_values(sample_audio(sample), sample["wide"])
+        full_scale = 32768 if sample["wide"] else 128
+        powers[key] = sum(v * v for v in values) / max(1, len(values)) / full_scale ** 2
+    buckets = collections.Counter()
+    for channel in played["notes"]:
+        for voice in channel:
+            points = sorted(dict(voice.points).items())
+            envelope = sorted(dict(voice.envelope).items()) if voice.envelope else None
+            if not points:
+                continue
+            time = voice.start
+            while time < min(voice.end, played["length"]):
+                level = _value_at(points, time) / 64 * (_value_at(envelope, time) if envelope else 1)
+                buckets[int(time // LOUDNESS_STEP)] += level ** 2 * powers[voice.instrument[:2]]
+                time += LOUDNESS_STEP
+    levels = sorted(buckets.values())
+    return math.sqrt(levels[int(len(levels) * 0.95)]) if levels else 1.0
+
+
 def custom_samples(song, shifts):
     """One embedded sample per (instrument, sample) that gets played."""
     urls = []
@@ -1026,6 +1144,9 @@ def convert(path, output_dir, beats_per_bar):
     played = simulate(song)
     bar_parts = beats_per_bar * PARTS_PER_BEAT
     lead_in = add_lead_in(played, bar_parts)
+    # A step takes 3 / speed synth ticks, at 2 synth ticks a part, and FT2 repeats every 3 ticks, which is 2 steps of a 2-note chord.
+    wanted_speed = 1 / played["parts_per_tick"]
+    song["arpeggio_speed"] = min(range(len(ARPEGGIO_SPEEDS)), key=lambda i: abs(ARPEGGIO_SPEEDS[i] - wanted_speed))
     for channel in played["notes"]:
         for voice in channel:
             voice.instrument = (*voice.instrument, fine_detune(voice))
@@ -1050,6 +1171,9 @@ def convert(path, output_dir, beats_per_bar):
     on_grid = starts[True] / max(1, sum(starts.values()))
     ticks_per_beat = 4 if on_grid >= ON_GRID_SHARE else PARTS_PER_BEAT
     sample_chars, halved = fit_samples_in_url(song, shifts)
+    # With UltraBox's compressor off to match FT2's linear mixing, a song's level is set here to suit how busy it is.
+    loudness = estimated_loudness(song, played)
+    master_gain = round(min(MAX_MASTER_GAIN, math.sqrt(LEVEL_TARGET / loudness)) * 50) / 50
     slots = assign_channels(by_xm, bar_parts)
     bar_count = math.ceil(round(played["length"]) / bar_parts)
     for instrument in song["instruments"].values():
@@ -1058,14 +1182,14 @@ def convert(path, output_dir, beats_per_bar):
     mod_channels, vibrato_speeds, panned = build_mod_channels(slots, song, bar_count, ticks_per_beat, bar_parts)
     channels = [build_channel(s, song, shifts, bar_count, ticks_per_beat, bar_parts, v, m) for s, v, m in zip(slots, vibrato_speeds, panned)]
     if len(channels) > MAX_CHANNELS or len(mod_channels) > MAX_CHANNELS:
-        raise SystemExit(f"{path.name} needs {len(channels)} note and {len(mod_channels)} modulation channels; UltraBox allows {MAX_CHANNELS} of each")
+        raise TooManyChannels(f"{path.name} needs {len(channels)} note and {len(mod_channels)} modulation channels at {beats_per_bar} beats per bar; UltraBox allows {MAX_CHANNELS} of each")
     channels += mod_channels
     intro = int(played["loop_start"] // bar_parts)
     samples = custom_samples(song, shifts)
     result = {"format": "UltraBox", "version": 5, "name": song["title"] or path.stem, "scale": "Free", "key": "C",
               "introBars": intro, "loopBars": bar_count - intro, "beatsPerBar": beats_per_bar,
               "ticksPerBeat": ticks_per_beat, "beatsPerMinute": round(played["tempo"]),
-              "layeredInstruments": False, "patternInstruments": True, "compressionRatio": 0, "masterGain": MASTER_GAIN, "customSamples": samples, "channels": channels}
+              "layeredInstruments": False, "patternInstruments": True, "compressionRatio": 0, "masterGain": master_gain, "customSamples": samples, "channels": channels}
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{path.stem}.ultrabox.json"
     json_path.write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
@@ -1118,9 +1242,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("xm", type=pathlib.Path)
     parser.add_argument("-o", "--output", type=pathlib.Path, default=pathlib.Path("output"))
-    parser.add_argument("--beats-per-bar", type=int, default=16)
+    parser.add_argument("--beats-per-bar", type=int, help="by default, the longest bar that fits the song's channels")
     args = parser.parse_args()
-    convert(args.xm, args.output, args.beats_per_bar)
+    error = None
+    for beats in ([args.beats_per_bar] if args.beats_per_bar else BAR_SIZES):
+        try:
+            return convert(args.xm, args.output, beats)
+        except TooManyChannels as problem:
+            error = problem
+    raise SystemExit(str(error))
 
 
 if __name__ == "__main__":
