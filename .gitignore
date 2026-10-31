@@ -1,7 +1,2 @@
-*.txt
-*.json
-*.exe
-*.dll
-*.wav
+/output
 *.pyc
-output/dream complex ii.samples
