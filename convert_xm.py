@@ -19,7 +19,7 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
-import xm2box
+import xm2ultrabox
 
 PROJECT = pathlib.Path(__file__).parent
 XM_FOLDER = PROJECT / "xm"
@@ -36,8 +36,8 @@ def convert(path, output_folder, rough):
     """Convert a song, keeping the report that the converter prints. Returns the song's path and the report."""
     report = io.StringIO()
     with contextlib.redirect_stdout(report):
-        song = xm2box.convert_at_best_bar_size(path, output_folder, rough=rough,
-                                               sample_url=xm2box.DEFAULT_SAMPLE_URL if rough else None, require_url_fit=not rough)
+        song = xm2ultrabox.convert_at_best_bar_size(path, output_folder, rough=rough,
+                                                    sample_url=xm2ultrabox.DEFAULT_SAMPLE_URL if rough else None, require_url_fit=not rough)
     return song, report.getvalue()
 
 
@@ -151,7 +151,7 @@ class App:
         try:
             made = convert_to_beepbox(path, self.output_folder) if song_format == "beepbox" else convert(path, self.output_folder, rough)
             self.results.put(("done", *made, rough))
-        except (xm2box.SamplesTooBig, xm2box.TooManyChannels) as problem:
+        except (xm2ultrabox.SamplesTooBig, xm2ultrabox.TooManyChannels) as problem:
             self.results.put(("too big", str(problem)))
         except ImportError as problem:
             self.results.put(("needs numpy", str(problem)))

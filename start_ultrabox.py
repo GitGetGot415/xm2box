@@ -6,7 +6,7 @@ Usage: python start_ultrabox.py
 Then use File > Import Song in the page that opens. This stops by itself when you close that page.
 
 Firefox stops websites from reaching servers on your computer unless you give permission. A page that
-comes from this server doesn't count, so songs made with xm2box.py --rough can load their samples here.
+comes from this server doesn't count, so songs made with xm2ultrabox.py --rough can load their samples here.
 It only answers requests from this computer. The first time UltraBox asks for each of its files,
 that file is downloaded into the ultrabox folder.
 """

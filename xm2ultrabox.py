@@ -5,7 +5,7 @@ Carries over notes, timing, song order, volume, vibrato, pitch slides and the mo
 own samples, which are stored inside the song file. The report written next to the song
 lists what was left out.
 
-Usage: python xm2box.py song.xm [-o output_dir] [--beats-per-bar 16]
+Usage: python xm2ultrabox.py song.xm [-o output_dir] [--beats-per-bar 16]
 
 --beepbox makes a regular BeepBox song instead, which only imitates the samples. See xm2beepbox.py.
 

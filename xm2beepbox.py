@@ -16,7 +16,7 @@ import pathlib
 
 import numpy as np
 
-import xm2box
+import xm2ultrabox
 
 MAX_PITCH_CHANNELS = 10
 MAX_NOISE_CHANNELS = 5
@@ -60,16 +60,16 @@ MIX_TARGET_RMS = 0.13  # about where FT2's render of these songs sits
 MIX_MAX_GAIN = 1e3
 SAME_VOLUME_RANGE = 3  # drums within this many volume steps can share a channel's instrument volume
 PAN_STEP = 25  # BeepBox can pan further in between, but more positions would split a sound across more channels
-PAN_SWEEP_MIN = 5  # how far a pan envelope must swing, out of xm2box.MAX_PAN, to count as moving
+PAN_SWEEP_MIN = 5  # how far a pan envelope must swing, out of xm2ultrabox.MAX_PAN, to count as moving
 VIBRATO_PRESETS = (("light", 0.15), ("heavy", 0.45))
 VIBRATO_MIN_SHARE = 0.25  # the share of a note with vibrato before its instrument needs vibrato
 MIN_DETUNE_CENTS = 4
-SEMITONES_PER_RAW_VIBRATO = 1 / xm2box.VIBRATO_RAW_PER_SEMITONE
+SEMITONES_PER_RAW_VIBRATO = 1 / xm2ultrabox.VIBRATO_RAW_PER_SEMITONE
 
 
 def to_mono_values(sample):
     width = 32768 if sample["wide"] else 128
-    return np.array(xm2box.as_values(xm2box.sample_audio(sample), sample["wide"]), dtype=float) / width
+    return np.array(xm2ultrabox.as_values(xm2ultrabox.sample_audio(sample), sample["wide"]), dtype=float) / width
 
 
 def loudness_curve(values):
@@ -97,7 +97,7 @@ def average_spectrum(values):
 
 def harmonic_share(power, f0):
     """How much of a spectrum's power sits on the harmonics of f0."""
-    hertz_per_bin = xm2box.SAMPLE_RATE / ANALYSIS_FRAMES
+    hertz_per_bin = xm2ultrabox.SAMPLE_RATE / ANALYSIS_FRAMES
     total = power.sum()
     if total <= 0:
         return 0.0
@@ -116,7 +116,7 @@ def harmonic_share(power, f0):
 def find_fundamental(power):
     """The highest pitch whose harmonics hold nearly as much of the sound as any lower pitch's do."""
     candidates = 20 * 2 ** (np.arange(0, 6.5 * 48) / 48)
-    candidates = candidates[candidates < xm2box.SAMPLE_RATE / 4]
+    candidates = candidates[candidates < xm2ultrabox.SAMPLE_RATE / 4]
     shares = np.array([harmonic_share(power, f) for f in candidates])
     best = shares.max() if len(shares) else 0.0
     if best <= 0:
@@ -149,7 +149,7 @@ def nearest_control(wanted, level):
 
 def fit_harmonics(power, f0):
     """Turn a spectrum into BeepBox harmonics values, with how loud the resulting wave comes out."""
-    hertz_per_bin = xm2box.SAMPLE_RATE / ANALYSIS_FRAMES
+    hertz_per_bin = xm2ultrabox.SAMPLE_RATE / ANALYSIS_FRAMES
     last = len(power) - 1
     strengths = []
     for k in range(1, CONTROL_POINTS_HARMONICS + 1):
@@ -184,7 +184,7 @@ def spectrum_point_octave(point):
 
 def fit_spectrum(power, playback, base_hertz):
     """Turn a spectrum, played back this many times faster, into BeepBox spectrum values above a base frequency."""
-    hertz = np.arange(len(power)) * xm2box.SAMPLE_RATE / ANALYSIS_FRAMES * playback
+    hertz = np.arange(len(power)) * xm2ultrabox.SAMPLE_RATE / ANALYSIS_FRAMES * playback
     wanted = []
     for point in range(CONTROL_POINTS_SPECTRUM):
         low = base_hertz * 2 ** (spectrum_point_octave(point) - 0.5 / SPECTRUM_POINTS_PER_OCTAVE)
@@ -246,7 +246,7 @@ def drum_lowest_octave(slot):
 
 def best_drum_slot(power, playback):
     """The drumset slot whose frequency range covers the most of a sound's power."""
-    hertz = np.arange(len(power)) * xm2box.SAMPLE_RATE / ANALYSIS_FRAMES * playback
+    hertz = np.arange(len(power)) * xm2ultrabox.SAMPLE_RATE / ANALYSIS_FRAMES * playback
     def covered(slot):
         low = drum_base_hertz(slot)
         high = low * 2 ** spectrum_point_octave(CONTROL_POINTS_SPECTRUM - 1)
@@ -268,13 +268,13 @@ class SampleSound:
         median_pitch = sorted(self.pitches.elements())[sum(self.pitches.values()) // 2]
         self.playback_rate = lambda pitch: 2 ** ((pitch - BEEPBOX_PITCH_OF_C4 + sample["finetune"] / 128) / 12)
         seconds = sorted(v.end - v.start for v in voices)[len(voices) // 2] / max(1e-9, voices[0].parts_per_second)
-        frames = int(seconds * xm2box.SAMPLE_RATE * self.playback_rate(median_pitch))
-        region = self.values[:max(ANALYSIS_FRAMES, frames)] if sample["loop"] == xm2box.LOOP_NONE else self.values[:max(ANALYSIS_FRAMES * 2, frames)]
+        frames = int(seconds * xm2ultrabox.SAMPLE_RATE * self.playback_rate(median_pitch))
+        region = self.values[:max(ANALYSIS_FRAMES, frames)] if sample["loop"] == xm2ultrabox.LOOP_NONE else self.values[:max(ANALYSIS_FRAMES * 2, frames)]
         self.power = average_spectrum(region)
         self.f0, self.share = find_fundamental(self.power)
-        self.seconds = len(self.values) / xm2box.SAMPLE_RATE / self.playback_rate(median_pitch)
+        self.seconds = len(self.values) / xm2ultrabox.SAMPLE_RATE / self.playback_rate(median_pitch)
         bendy = sum(len(v.path) > 1 for v in voices) / len(voices)
-        one_shot = sample["loop"] == xm2box.LOOP_NONE
+        one_shot = sample["loop"] == xm2ultrabox.LOOP_NONE
         few_pitches = len(self.pitches) <= DRUM_MAX_PITCHES and bendy < 0.2
         if one_shot and few_pitches and (self.share < TONAL_SHARE or self.seconds < DRUM_MAX_SECONDS):
             self.kind = "drum"
@@ -292,7 +292,7 @@ class SampleSound:
             self.controls, self.wave_level = fit_harmonics(self.power, self.f0)
         elif self.kind == "spectrum":
             # A noisy sound has no pitch to match, so its lowest strong frequency sets where its spectrum starts.
-            hertz = np.arange(len(self.power)) * xm2box.SAMPLE_RATE / ANALYSIS_FRAMES * self.playback_rate(median_pitch)
+            hertz = np.arange(len(self.power)) * xm2ultrabox.SAMPLE_RATE / ANALYSIS_FRAMES * self.playback_rate(median_pitch)
             running = np.cumsum(self.power) / max(self.power.sum(), 1e-12)
             low = max(32.7, float(hertz[int(np.searchsorted(running, 0.02))]))
             target = round(BEEPBOX_PITCH_OF_C4 + 12 * math.log2(low / C4_HZ))
@@ -305,10 +305,10 @@ class SampleSound:
     def loudness_at(self, frame):
         """A sample's loudness at some frame, following its loop."""
         sample = self.sample
-        if sample["loop"] != xm2box.LOOP_NONE and frame >= sample["loop_end"]:
+        if sample["loop"] != xm2ultrabox.LOOP_NONE and frame >= sample["loop_end"]:
             start, end = sample["loop_start"], sample["loop_end"]
             length = max(1, end - start)
-            passed = (frame - start) % (length * (2 if sample["loop"] == xm2box.LOOP_PING_PONG else 1))
+            passed = (frame - start) % (length * (2 if sample["loop"] == xm2ultrabox.LOOP_PING_PONG else 1))
             frame = start + (passed if passed < length else 2 * length - passed)
         return self.curve[min(len(self.curve) - 1, int(frame // LOUDNESS_WINDOW))]
 
@@ -319,7 +319,7 @@ class SampleSound:
 
 
 def describe_sound(key, sound):
-    name = xm2box.wave_name(*key)
+    name = xm2ultrabox.wave_name(*key)
     if sound.kind == "drum":
         return f"  {name}: drum, {len(sound.pitches)} pitch(es), harmonic share {sound.share:.0%}"
     if sound.kind == "spectrum":
@@ -330,7 +330,7 @@ def describe_sound(key, sound):
 def follow_sample_loudness(voice, sound):
     """Add a sample's own loudness to a note's volume shape."""
     offset = voice.instrument[2] if len(voice.instrument) > 2 else 0
-    rate = xm2box.SAMPLE_RATE * sound.playback_rate(voice.pitch) / voice.parts_per_second
+    rate = xm2ultrabox.SAMPLE_RATE * sound.playback_rate(voice.pitch) / voice.parts_per_second
     shape = []
     time = voice.start
     while time < voice.end:
@@ -339,7 +339,7 @@ def follow_sample_loudness(voice, sound):
     shape.append((voice.end, sound.loudness_at(offset + (voice.end - voice.start) * rate)))
     if voice.envelope:
         points = sorted(dict(voice.envelope).items())
-        shape = [(t, level * xm2box._value_at(points, t)) for t, level in shape]
+        shape = [(t, level * xm2ultrabox._value_at(points, t)) for t, level in shape]
     voice.envelope = shape
 
 
@@ -369,12 +369,12 @@ def pan_position(voice, sample):
     """A note's fixed place in the stereo field. Pan that sweeps can't, so odd and even XM channels go to opposite sides of it."""
     if voice.pan:
         values = [v for _, v in voice.pan]
-        middle = (sum(values) / len(values) - xm2box.MAX_PAN / 2) * 2
+        middle = (sum(values) / len(values) - xm2ultrabox.MAX_PAN / 2) * 2
         swing = (sum((v - sum(values) / len(values)) ** 2 for v in values) / len(values)) ** 0.5 * 2
         if swing >= PAN_SWEEP_MIN:
             middle += swing if voice.xm_channel % 2 else -swing
     else:
-        middle = (sample["pan"] / 255 * xm2box.MAX_PAN - xm2box.MAX_PAN / 2) * 2
+        middle = (sample["pan"] / 255 * xm2ultrabox.MAX_PAN - xm2ultrabox.MAX_PAN / 2) * 2
     return max(-100, min(100, round(middle / PAN_STEP) * PAN_STEP))
 
 
@@ -522,7 +522,7 @@ def assign_drums(voices, sounds, bar_parts):
         levels = [max((v for _, v, _ in piece), default=0) for voice in members for _, piece, _ in voice.pieces]
         loudest = percentile_level(levels, [1] * len(levels)) if levels else 0.0
         drums[drum] = dict(slot=slot, controls=controls, loudest=loudest, voices=members,
-                           energy=sum(xm2box.note_energy(piece) for voice in members for _, piece, _ in voice.pieces))
+                           energy=sum(xm2ultrabox.note_energy(piece) for voice in members for _, piece, _ in voice.pieces))
     channels = []
     for drum, info in sorted(drums.items(), key=lambda d: -d[1]["energy"]):
         need = info["loudest"] / max(1e-12, drum_unit_level(info["controls"], info["slot"]))
@@ -574,7 +574,7 @@ def drum_channel_json(channel, name, bar_parts, bar_count, gain):
     by_bar = collections.defaultdict(list)
     placed = 0
     for _, drum, voice in hits:
-        pieces = xm2box.build_note_pieces(voice, bar_parts)
+        pieces = xm2ultrabox.build_note_pieces(voice, bar_parts)
         for index, (bar, piece, continues) in enumerate(pieces):
             reference = units[drum] * scale / gain
             points = note_points(piece, reference, bar * bar_parts, closes=index == len(pieces) - 1)
@@ -646,8 +646,8 @@ def simulate_to_fit(song):
     """Play the song at a tempo BeepBox can hold, and at few enough bars. Half the tempo holds twice the song in a bar."""
     max_tempo = MAX_TEMPO
     while True:
-        played = xm2box.simulate(song, max_tempo=max_tempo)
-        beats = played["length"] / xm2box.PARTS_PER_BEAT
+        played = xm2ultrabox.simulate(song, max_tempo=max_tempo)
+        beats = played["length"] / xm2ultrabox.PARTS_PER_BEAT
         for beats_per_bar in (4, 8, 16):
             if math.ceil((beats + beats_per_bar) / beats_per_bar) <= MAX_BARS:
                 return played, beats_per_bar
@@ -657,11 +657,11 @@ def simulate_to_fit(song):
 
 
 def convert(path, output_dir):
-    song = xm2box.parse_xm(path)
+    song = xm2ultrabox.parse_xm(path)
     played, beats_per_bar = simulate_to_fit(song)
-    bar_parts = beats_per_bar * xm2box.PARTS_PER_BEAT
-    lead_in = xm2box.add_lead_in(played, bar_parts)
-    parts_per_second = played["tempo"] * xm2box.PARTS_PER_BEAT / 60
+    bar_parts = beats_per_bar * xm2ultrabox.PARTS_PER_BEAT
+    lead_in = xm2ultrabox.add_lead_in(played, bar_parts)
+    parts_per_second = played["tempo"] * xm2ultrabox.PARTS_PER_BEAT / 60
     voices_by_sample = collections.defaultdict(list)
     all_voices = 0
     for xm_channel, channel in enumerate(played["notes"]):
@@ -678,7 +678,7 @@ def convert(path, output_dir):
     sounds = {key: SampleSound(song["instruments"][key[0]]["samples"][key[1]], voices) for key, voices in voices_by_sample.items()}
     for instrument in song["instruments"].values():
         if instrument["auto_vibrato"]:
-            instrument["auto_settings"] = xm2box.auto_vibrato_settings(instrument["auto_vibrato"], played["base_bpm"], played["parts_per_tick"])
+            instrument["auto_settings"] = xm2ultrabox.auto_vibrato_settings(instrument["auto_vibrato"], played["base_bpm"], played["parts_per_tick"])
 
     tonal = collections.defaultdict(list)
     drum_voices = []
@@ -687,9 +687,9 @@ def convert(path, output_dir):
         auto = song["instruments"][key[0]].get("auto_settings")
         vibrato = main_vibrato(voices, auto)
         for voice in voices:
-            if sound.sample["loop"] == xm2box.LOOP_NONE:
+            if sound.sample["loop"] == xm2ultrabox.LOOP_NONE:
                 end_frame = sound.ends_at() - (voice.instrument[2] if len(voice.instrument) > 2 else 0)
-                voice.end = min(voice.end, voice.start + max(1, end_frame) / (xm2box.SAMPLE_RATE * sound.playback_rate(voice.pitch)) * parts_per_second)
+                voice.end = min(voice.end, voice.start + max(1, end_frame) / (xm2ultrabox.SAMPLE_RATE * sound.playback_rate(voice.pitch)) * parts_per_second)
             follow_sample_loudness(voice, sound)
             if sound.kind == "drum":
                 drum_voices.append(voice)
@@ -703,13 +703,13 @@ def convert(path, output_dir):
     for key in sorted(tonal):
         kept = []
         for voice in merge_doubles(tonal[key]):
-            pieces = xm2box.build_note_pieces(voice, bar_parts)
+            pieces = xm2ultrabox.build_note_pieces(voice, bar_parts)
             if pieces:
                 voice.pieces = pieces
                 kept.append((voice, pieces))
         by_xm.append(kept)
     for voice in drum_voices:
-        voice.pieces = xm2box.build_note_pieces(voice, bar_parts)
+        voice.pieces = xm2ultrabox.build_note_pieces(voice, bar_parts)
     drum_voices = [v for v in drum_voices if v.pieces]
 
     # An instrument's volume sets the level of its full note size, and the whole song's gain is its quietest fit.
@@ -730,7 +730,7 @@ def convert(path, output_dir):
     gain = min(MIX_MAX_GAIN, 1 / max(needs)) if needs else 1.0
     volumes = {key: max(0, min(QUIETEST_VOLUME, round(-2 * math.log2(max(1e-12, need * gain))))) for key, need in wanted.items()}
 
-    slots, left_out = xm2box.assign_tracks(by_xm, max_channels=MAX_PITCH_CHANNELS)
+    slots, left_out = xm2ultrabox.assign_tracks(by_xm, max_channels=MAX_PITCH_CHANNELS)
     bar_count = min(MAX_BARS, math.ceil(round(played["length"]) / bar_parts))
     channels, tonal_notes = [], 0
     for slot in slots:
@@ -745,19 +745,19 @@ def convert(path, output_dir):
 
     intro = min(bar_count - 1, int(played["loop_start"] // bar_parts))
     result = {"format": "BeepBox", "version": 9, "name": song["title"] or path.stem, "scale": "expert", "key": "C",
-              "introBars": intro, "loopBars": max(1, bar_count - intro), "beatsPerBar": beats_per_bar, "ticksPerBeat": xm2box.PARTS_PER_BEAT,
+              "introBars": intro, "loopBars": max(1, bar_count - intro), "beatsPerBar": beats_per_bar, "ticksPerBeat": xm2ultrabox.PARTS_PER_BEAT,
               "beatsPerMinute": round(played["tempo"]), "layeredInstruments": False, "patternInstruments": True, "channels": channels}
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{path.stem}.beepbox.json"
     json_path.write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
 
     total_pieces = sum(len(p) for kept in by_xm for _, p in kept)
-    energy_kept = sum(xm2box.note_energy(item[1]) for slot in slots for items in slot["notes"].values() for item in items)
-    energy_all = sum(xm2box.note_energy(piece) for kept in by_xm for _, pieces in kept for _, piece, _ in pieces)
+    energy_kept = sum(xm2ultrabox.note_energy(item[1]) for slot in slots for items in slot["notes"].values() for item in items)
+    energy_all = sum(xm2ultrabox.note_energy(piece) for kept in by_xm for _, pieces in kept for _, piece, _ in pieces)
     cut = max(0, math.ceil(round(played["length"]) / bar_parts) - bar_count)
     lines = [f"{path.name} -> {json_path.name}", "",
              "This is an approximation. BeepBox can't play samples, so the sounds are imitations.",
-             f"Tempo {result['beatsPerMinute']}, {bar_count} bars of {beats_per_bar} beats ({lead_in / xm2box.PARTS_PER_BEAT:g} beats of silent lead-in added)",
+             f"Tempo {result['beatsPerMinute']}, {bar_count} bars of {beats_per_bar} beats ({lead_in / xm2ultrabox.PARTS_PER_BEAT:g} beats of silent lead-in added)",
              f"{len(slots)} pitch channels and {len(noise_channels)} noise channels (from {song['channels']} XM channels)",
              f"{left_out} of {total_pieces} tonal note pieces left out to fit {MAX_PITCH_CHANNELS} channels, {1 - energy_kept / max(1e-12, energy_all):.1%} of their sound energy",
              f"{tonal_notes} tonal and {drum_notes} drum note pieces placed", "", "How each sample is imitated:"]
