@@ -87,6 +87,10 @@ class TooManyChannels(Exception):
     pass
 
 
+class SamplesTooBig(Exception):
+    pass
+
+
 def read_string(data):
     return data.split(b"\0")[0].decode("latin1").strip()
 
@@ -222,18 +226,18 @@ def upper_half_share(sample):
 def fit_samples_in_url(song, shifts):
     """Halve the rate of the biggest samples that lose the least, until the song fits in a Firefox URL."""
     samples = {key: song["instruments"][key[0]]["samples"][key[1]] for key in shifts}
-    size = lambda: sum(len(sample_audio(s)) * 4 // 3 + SAMPLE_URL_OVERHEAD for s in samples.values())
-    total = size()
+    url_size = lambda sample: len(sample_audio(sample)) * 4 // 3 + SAMPLE_URL_OVERHEAD
+    sizes = {key: url_size(sample) for key, sample in samples.items()}
+    total = sum(sizes.values())
     halved = []
-    candidates = sorted(samples, key=lambda k: -len(sample_audio(samples[k])))
-    for key in candidates:
+    for key in sorted(samples, key=lambda k: -sizes[k]):
         if total <= SAMPLE_URL_BUDGET:
             break
         if upper_half_share(samples[key]) > HALVING_LOSS_LIMIT:
             continue
         samples[key]["halved"] = True
         halved.append(key)
-        total = size()
+        total += url_size(samples[key]) - sizes[key]
     return total, halved
 
 
@@ -1239,7 +1243,7 @@ def describe_instrument(instrument):
     return text
 
 
-def convert(path, output_dir, beats_per_bar, rough=False, sample_url=None):
+def convert(path, output_dir, beats_per_bar, rough=False, sample_url=None, require_url_fit=False):
     song = parse_xm(path)
     played = simulate(song)
     bar_parts = beats_per_bar * PARTS_PER_BEAT
@@ -1275,6 +1279,8 @@ def convert(path, output_dir, beats_per_bar, rough=False, sample_url=None):
     on_grid = starts[True] / max(1, sum(starts.values()))
     ticks_per_beat = 4 if on_grid >= ON_GRID_SHARE else PARTS_PER_BEAT
     sample_chars, halved = fit_samples_in_url(song, shifts) if not sample_url else (0, [])
+    if require_url_fit and sample_chars > SAMPLE_URL_BUDGET:
+        raise SamplesTooBig(f"Its samples take {sample_chars / 1e6:.1f} MB, and only {SAMPLE_URL_BUDGET / 1e6:.2f} MB fits in a song's URL in Firefox.")
     # With UltraBox's compressor off to match FT2's linear mixing, a song's level is set here to suit how busy it is.
     loudness = estimated_loudness(song, played)
     master_gain = round(min(MAX_MASTER_GAIN, math.sqrt(LEVEL_TARGET / loudness)) * 50) / 50
@@ -1346,6 +1352,17 @@ def convert(path, output_dir, beats_per_bar, rough=False, sample_url=None):
     return json_path
 
 
+def convert_at_best_bar_size(path, output_dir, beats_per_bar=None, **options):
+    """Convert a song at the longest bar that fits its channels."""
+    error = None
+    for beats in ([beats_per_bar] if beats_per_bar else BAR_SIZES):
+        try:
+            return convert(path, output_dir, beats, **options)
+        except TooManyChannels as problem:
+            error = problem
+    raise error
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("xm", type=pathlib.Path)
@@ -1354,14 +1371,11 @@ def main():
     parser.add_argument("--rough", action="store_true", help="make an approximate version of a song too big to convert normally")
     parser.add_argument("--sample-url", help=f"serve samples from here instead of embedding them (--rough uses {DEFAULT_SAMPLE_URL})")
     args = parser.parse_args()
-    error = None
     sample_url = args.sample_url or (DEFAULT_SAMPLE_URL if args.rough else None)
-    for beats in ([args.beats_per_bar] if args.beats_per_bar else BAR_SIZES):
-        try:
-            return convert(args.xm, args.output, beats, args.rough, sample_url)
-        except TooManyChannels as problem:
-            error = problem
-    raise SystemExit(str(error))
+    try:
+        convert_at_best_bar_size(args.xm, args.output, args.beats_per_bar, rough=args.rough, sample_url=sample_url)
+    except TooManyChannels as problem:
+        raise SystemExit(str(problem))
 
 
 if __name__ == "__main__":
