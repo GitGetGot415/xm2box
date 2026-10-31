@@ -20,6 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 import xm2box
 
 PROJECT = pathlib.Path(__file__).parent
+XM_FOLDER = PROJECT / "xm"
 OUTPUT_FOLDER = PROJECT / "output"
 ROUGH_QUESTION = ("This song is too big to convert normally:\n\n{reason}\n\n"
                   "A rough version plays the song and can be edited, but it's less faithful. Notes keep one of a few "
@@ -81,7 +82,7 @@ class App:
         root.after(100, self.check_results)
 
     def choose(self):
-        name = filedialog.askopenfilename(title="Choose a FastTracker II module", filetypes=[("FastTracker II modules", "*.xm"), ("All files", "*.*")])
+        name = filedialog.askopenfilename(title="Choose a FastTracker II module", initialdir=XM_FOLDER, filetypes=[("FastTracker II modules", "*.xm"), ("All files", "*.*")])
         if name:
             self.set_file(name)
 
