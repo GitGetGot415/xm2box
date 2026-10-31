@@ -22,6 +22,8 @@ python convert_xm.py
 
 Choose an `.xm` file, select UltraBox or BeepBox, and click **Convert**. Converted files are saved in `output/`.
 
+For a player that reads the song file directly, tick **Keep full-quality samples in one file** before converting to UltraBox.
+
 ## Command line
 
 Convert to UltraBox:
@@ -40,5 +42,11 @@ For UltraBox songs that use external samples, run the local player and import th
 
 ```sh
 python start_ultrabox.py
+```
+
+For a player that reads the song file directly, keep every sample inside one file at full quality. Add `--rough` for a song too big to convert normally:
+
+```sh
+python xm2ultrabox.py "xm/song.xm" --rough --embed-samples
 ```
 
